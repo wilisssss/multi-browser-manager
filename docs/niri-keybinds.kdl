@@ -1,0 +1,44 @@
+# Keybinds niri untuk Multi Browser Manager
+#
+# Kombinasi ini dipilih dari config niri kamu (~/.config/niri/config.kdl)
+# dan dijamin TIDAK bentrok dengan bind yang sudah ada (Mod+B = thorium,
+# Mod+M = QuickShell launcher, dst.).
+#
+# Skema (mnemonik D = Dashboard):
+#   Mod+D        → buka / focus dashboard MBM
+#   Mod+Shift+D  → menu fuzzel: pilih profile → launch
+#   Mod+Ctrl+D   → menu fuzzel: pilih profile yang running → stop
+#
+# Prasyarat (sudah disiapkan):
+#   - symlink: ~/.local/bin/mbm -> src-tauri/target/debug/multi-browser-manager
+#     (kalau nanti install release via `cargo tauri build`, ganti symlink target
+#      ke /usr/bin/multi-browser-manager atau ganti "mbm" di binds di bawah)
+#   - jq + fuzzel (sudah ada di sistemmu)
+#
+# Catatan perilaku:
+#   - App single-instance: Mod+D saat dashboard sudah terbuka cukup mem-focus-nya.
+#   - Setelah spawn pertama kali, jalankan `niri msg action load-config-file`
+#     atau reload via Mod+Shift+C agar binds aktif.
+
+binds {
+    // ── Multi Browser Manager ─────────────────────────────────────────────
+    Mod+D hotkey-overlay-title="Multi Browser Manager: Dashboard" {
+        spawn "mbm";
+    }
+
+    Mod+Shift+D hotkey-overlay-title="Multi Browser Manager: Launch Profile" {
+        // ● = running, ○ = stopped; sed strips the status marker before launching.
+        spawn-sh "mbm --list | jq -r '.[] | (if .status == \"running\" then \"● \" else \"○ \" end) + .name' | fuzzel --dmenu --prompt='launch profile ❯ ' | sed 's/^[^ ]* //' | xargs -r -I{} mbm --launch {}";
+    }
+
+    Mod+Ctrl+D hotkey-overlay-title="Multi Browser Manager: Stop Profile" {
+        spawn-sh "mbm --list | jq -r '.[] | select(.status == \"running\") | \"● \" + .name' | fuzzel --dmenu --prompt='stop profile ❯ ' | sed 's/^[^ ]* //' | xargs -r -I{} mbm --stop {}";
+    }
+
+    // ── Opsional: launch profile ke-N langsung dari keybind ──────────────
+    // Urutan = alfabetis sesuai `mbm --list`. Aktifkan kalau mau:
+    //
+    // Mod+Alt+1 { spawn-sh "mbm --launch \"$(mbm --list | jq -r '.[0].name')\""; }
+    // Mod+Alt+2 { spawn-sh "mbm --launch \"$(mbm --list | jq -r '.[1].name')\""; }
+    // Mod+Alt+3 { spawn-sh "mbm --launch \"$(mbm --list | jq -r '.[2].name')\""; }
+}

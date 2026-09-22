@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+/* Class-based dark mode: the `.dark` class on a root wrapper toggles the theme
+   (Tauri webviews don't reliably expose prefers-color-scheme). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+html, body, #root {
+  height: 100%;
+  font-family: "JetBrainsMono Nerd Font", "JetBrainsMono NF", "JetBrainsMono NFM",
+    "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* Tailwind font utilities (font-sans, font-medium inheritance, etc.) */
+@theme {
+  --font-sans: "JetBrainsMono Nerd Font", "JetBrainsMono NF", "JetBrainsMono NFM",
+    "JetBrains Mono", ui-monospace, monospace;
+  --font-mono: "JetBrainsMono Nerd Font", "JetBrainsMono NF", "JetBrainsMono NFM",
+    "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* Native controls (select dropdown popups, scrollbars) follow color-scheme,
+   not CSS classes — the app sets this dynamically from useTheme. */
+html {
+  color-scheme: light;
+}
+html.dark {
+  color-scheme: dark;
+}
+
+/* Keep option rows readable inside the native popup in both schemes. */
+select option {
+  background-color: #ffffff;
+  color: #171717;
+}
+html.dark select option {
+  background-color: #171717;
+  color: #f5f5f5;
+}

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- MBM tray/app icon: blue rounded square + bold white M -->
+  <rect width="128" height="128" rx="28" ry="28" fill="#2563EB"/>
+  <text x="64" y="99"
+        font-family="DejaVu Sans"
+        font-weight="bold"
+        font-size="92"
+        fill="#FFFFFF"
+        text-anchor="middle">M</text>
+</svg>
