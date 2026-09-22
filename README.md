@@ -136,6 +136,31 @@ Updater sudah ter-wire (tauri-plugin-updater + tombol "Check updates" di header)
 3. Upload artefak + `latest.json` (dihasilkan updater) ke GitHub Releases.
 4. Di Linux, updater hanya mendukung bundle **AppImage** (deb/rpm update via package manager).
 
+### Release via GitHub Actions (otomatis)
+
+`.github/workflows/release.yml` mem-build AppImage + .deb dan membuat GitHub Release
+(lengkap dengan `latest.json` untuk auto-updater) setiap kali tag `v*` di-push.
+
+Setup sekali:
+
+1. Buat repo GitHub, lalu:
+   ```bash
+   git remote add origin git@github.com:USERNAME/multi-browser-manager.git
+   git push -u origin main
+   ```
+2. Ganti `YOUR_USER` di `src-tauri/tauri.conf.json` → `plugins.updater.endpoints`
+   dengan username GitHub kamu.
+3. Tambahkan **Secrets** di repo (Settings → Secrets and variables → Actions):
+   - `TAURI_SIGNING_PRIVATE_KEY` → isi file `~/.tauri/mbm-updater.key`
+   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` → kosongkan (key dibuat tanpa password)
+4. Rilis:
+   ```bash
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+   CI akan membuat release + aset: `*.AppImage`, `*.AppImage.sig`, `*.deb`,
+   `*.deb.sig`, dan `latest.json` (URL updater: `.../releases/latest/download/latest.json`).
+
 ## Keyboard shortcuts (in-app)
 
 | Key | Aksi |

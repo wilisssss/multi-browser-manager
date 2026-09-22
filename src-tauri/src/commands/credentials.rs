@@ -137,6 +137,9 @@ pub struct UpdateCredentialInput {
 
 /// Deserializes JSON `null` as `Some(None)` while an absent field stays `None`,
 /// so "clear this secret" can be distinguished from "leave it unchanged".
+// Only exercised from tests right now (see double_option_distinguishes_null_from_absent);
+// keep it available for future DTOs without tripping the dead_code lint.
+#[cfg_attr(not(test), allow(dead_code))]
 fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
