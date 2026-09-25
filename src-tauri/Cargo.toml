@@ -1,6 +1,6 @@
 [package]
 name = "multi-browser-manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "Manage multiple isolated Chromium browser profiles from one dashboard"
 authors = ["MBM"]
 edition = "2021"

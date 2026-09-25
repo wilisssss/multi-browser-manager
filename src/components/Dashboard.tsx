@@ -573,14 +573,13 @@ export function Dashboard({ theme, toggleTheme }: Props) {
             onClick={updater.checkForUpdates}
             disabled={updater.status.state === "checking" || updater.status.state === "downloading"}
             title={`Check for updates${appVersion ? ` (current: v${appVersion})` : ""}`}
-            className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-neutral-600 hover:bg-neutral-200/70 disabled:opacity-50 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            className="rounded-lg px-3 py-2 text-sm text-neutral-600 hover:bg-neutral-200/70 disabled:opacity-50 dark:text-neutral-300 dark:hover:bg-neutral-800"
           >
             {updater.status.state === "checking" || updater.status.state === "downloading" ? (
               <RefreshCw className="h-4 w-4 animate-spin" />
             ) : (
               <Download className="h-4 w-4" />
             )}
-            Check update
           </button>
           <button
             onClick={toggleTheme}
