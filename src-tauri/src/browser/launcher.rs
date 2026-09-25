@@ -17,6 +17,9 @@ pub struct LaunchSpec {
     /// Per-profile extra launch arguments (feature: launch-args editor),
     /// already split into tokens by `parse_extra_args`.
     pub extra_args: Vec<String>,
+    /// Memory-trim ("lightweight") mode: append the curated RAM-saving flags
+    /// (see `MEMORY_TRIM_FLAGS`). Driven by the global settings toggle.
+    pub trim_memory: bool,
 }
 
 /// Stable, unique-per-profile window class / Wayland app-id:
@@ -57,11 +60,27 @@ pub fn build_args(spec: &LaunchSpec) -> Vec<String> {
         args.push(format!("--proxy-server={proxy}"));
     }
 
+    // Chromium does not merge repeated --disable-features (the last one
+    // wins), so all feature toggles are collected into a single flag.
+    let mut features: Vec<&str> = Vec::new();
+    if spec.trim_memory {
+        features.extend(MEMORY_TRIM_FEATURES);
+    }
+    if spec.extension_path.is_some() {
+        // Unpacked extensions require a non-default --user-data-dir (we always
+        // set one) and won't show the developer-mode bubble on a fresh dir.
+        features.push("DisableLoadExtensionCommandLineSwitch");
+    }
+    if !features.is_empty() {
+        args.push(format!("--disable-features={}", features.join(",")));
+    }
+
+    if spec.trim_memory {
+        args.extend(MEMORY_TRIM_FLAGS.iter().map(|s| s.to_string()));
+    }
+
     if let Some(ext) = &spec.extension_path {
         args.push(format!("--load-extension={ext}"));
-        // Unpacked extensions require a non-default --user-data-dir (we always set
-        // one) and won't show the developer-mode bubble on a fresh profile dir.
-        args.push("--disable-features=DisableLoadExtensionCommandLineSwitch".to_string());
     }
 
     // Per-profile power-user arguments last, so users can see (but not
@@ -70,6 +89,40 @@ pub fn build_args(spec: &LaunchSpec) -> Vec<String> {
 
     args
 }
+
+/// Feature toggles for the memory-trim ("lightweight") launch mode. Merged
+/// into the single `--disable-features` flag by `build_args`.
+const MEMORY_TRIM_FEATURES: &[&str] = &[
+    // Cast/media router service and its utility process.
+    "MediaRouter",
+    // Built-in translate UI + ML service.
+    "Translate",
+    // Remote optimization hints fetches.
+    "OptimizationHints",
+    // Content suggestions / feed prefetching.
+    "InterestFeedContentSuggestions",
+    // Back/forward cache keeps frozen pages alive in RAM.
+    "BackForwardCache",
+];
+
+/// Command-line flags for the memory-trim launch mode (feature toggles live
+/// in `MEMORY_TRIM_FEATURES`). Every profile is a full browser process tree
+/// (browser + GPU + network + utility + renderer + crashpad ≈ 6–8
+/// processes); these switch off what a farm/kiosk profile never uses and
+/// merge renderers per site — typically cutting idle RAM by a third or more.
+const MEMORY_TRIM_FLAGS: &[&str] = &[
+    // One renderer per site instead of per tab-instance: the biggest saving
+    // when a profile keeps several tabs of the same site open. Isolation
+    // BETWEEN profiles (the MBM guarantee) is untouched — that comes from
+    // separate user-data-dirs.
+    "--process-per-site",
+    // No hidden background pages from built-in component extensions.
+    "--disable-component-extensions-with-background-pages",
+    // No account sync, default apps, network prediction services.
+    "--disable-sync",
+    "--disable-background-networking",
+    "--disable-default-apps",
+];
 
 /// Flags MBM must keep under its own control: they define the isolation and
 /// identity of a profile, and letting a per-profile arg override them would
@@ -251,6 +304,7 @@ mod tests {
             extension_path: None,
             window_class: None,
             extra_args: vec![],
+            trim_memory: false,
         };
         let args = build_args(&spec);
         assert!(args.contains(&"--user-data-dir=/tmp/mbm/p1".to_string()));
@@ -269,6 +323,7 @@ mod tests {
             extension_path: None,
             window_class: None,
             extra_args: vec![],
+            trim_memory: false,
         };
         let args = build_args(&spec);
         assert!(args.contains(&"--proxy-server=socks5://10.0.0.1:1080".to_string()));
@@ -284,6 +339,7 @@ mod tests {
             extension_path: Some("/tmp/mbm-ext/p1".into()),
             window_class: None,
             extra_args: vec![],
+            trim_memory: false,
         };
         let args = build_args(&spec);
         assert!(args.contains(&"--load-extension=/tmp/mbm-ext/p1".to_string()));
@@ -300,6 +356,7 @@ mod tests {
             extension_path: None,
             window_class: Some("mbm-work-ab12".into()),
             extra_args: vec![],
+            trim_memory: false,
         };
         let args = build_args(&spec);
         assert!(args.contains(&"--class=mbm-work-ab12".to_string()));
@@ -345,6 +402,7 @@ mod tests {
             extension_path: None,
             window_class: None,
             extra_args: vec!["--disable-gpu".into(), "--start-maximized".into()],
+            trim_memory: false,
         };
         let args = build_args(&spec);
         let pos = args.iter().position(|a| a == "--disable-gpu").unwrap();
@@ -364,5 +422,60 @@ mod tests {
         ] {
             assert!(validate_extra_args(blocked).is_err(), "{blocked} must be blocked");
         }
+    }
+
+    fn base_spec() -> LaunchSpec {
+        LaunchSpec {
+            executable_path: "/usr/bin/chromium".into(),
+            user_data_dir: "/tmp/mbm/p1".into(),
+            proxy_server: None,
+            extension_path: None,
+            window_class: None,
+            extra_args: vec![],
+            trim_memory: false,
+        }
+    }
+
+    #[test]
+    fn memory_trim_appends_flags_and_is_off_by_default() {
+        let off = build_args(&base_spec());
+        assert!(!off.iter().any(|a| a.contains("process-per-site")));
+        assert!(!off.iter().any(|a| a.starts_with("--disable-features")));
+
+        let mut spec = base_spec();
+        spec.trim_memory = true;
+        let on = build_args(&spec);
+        assert!(on.contains(&"--process-per-site".to_string()));
+        assert!(on.contains(&"--disable-sync".to_string()));
+        let features = on
+            .iter()
+            .find(|a| a.starts_with("--disable-features="))
+            .unwrap();
+        for f in MEMORY_TRIM_FEATURES {
+            assert!(features.contains(f), "{f} must be in the merged flag");
+        }
+    }
+
+    #[test]
+    fn memory_trim_merges_with_extension_feature_flag() {
+        // Without trim: exactly one --disable-features for the extension switch.
+        let mut spec = base_spec();
+        spec.extension_path = Some("/tmp/ext".into());
+        let plain = build_args(&spec);
+        assert_eq!(
+            plain.iter().filter(|a| a.starts_with("--disable-features")).count(),
+            1,
+            "repeated --disable-features must never appear (last one would win)"
+        );
+
+        // With trim: still one flag, containing BOTH feature sets.
+        spec.trim_memory = true;
+        let merged = build_args(&spec);
+        let features = merged
+            .iter()
+            .find(|a| a.starts_with("--disable-features="))
+            .unwrap();
+        assert!(features.contains("DisableLoadExtensionCommandLineSwitch"));
+        assert!(features.contains("MediaRouter"));
     }
 }

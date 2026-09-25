@@ -45,8 +45,9 @@ const MAX_CRASH_RESTARTS: u32 = 3;
 fn load_launch_context(
     conn: &rusqlite::Connection,
     profile_id: &str,
-) -> AppResult<(Profile, Option<(String, String, i64, Option<String>)>)> {
+) -> AppResult<(Profile, Option<(String, String, i64, Option<String>)>, bool)> {
     let profile = get_profile_by_id(conn, profile_id)?;
+    let trim_memory = crate::commands::settings::load_settings(conn).lightweight_browsers;
     let proxy_row = conn
         .query_row(
             "SELECT protocol, host, port, username FROM proxies WHERE id = ?1",
@@ -61,7 +62,7 @@ fn load_launch_context(
             },
         )
         .ok(); // None if no proxy assigned
-    Ok((profile, proxy_row))
+    Ok((profile, proxy_row, trim_memory))
 }
 
 /// Slow, non-DB part of a launch: keyring read, extension generation and
@@ -72,6 +73,7 @@ fn build_launch_spec_blocking(
     state: &AppState,
     profile: &Profile,
     proxy_row: Option<(String, String, i64, Option<String>)>,
+    trim_memory: bool,
 ) -> AppResult<launcher::LaunchSpec> {
     let (proxy_server, extension_path) = match proxy_row {
         None => (None, None),
@@ -128,6 +130,7 @@ fn build_launch_spec_blocking(
         extension_path,
         window_class: Some(launcher::window_app_id(&profile.id, &profile.name)),
         extra_args,
+        trim_memory,
     })
 }
 
@@ -191,7 +194,7 @@ async fn do_launch_inner(
     let _action_guard = acquire_profile_action_lock(&state, &profile_id).await;
 
     // 1) Fast DB part — never holds the lock across slow work.
-    let (profile, proxy_row) = {
+    let (profile, proxy_row, trim_memory) = {
         let conn = match state.db.lock() {
             Ok(c) => c,
             Err(_) => {
@@ -203,7 +206,7 @@ async fn do_launch_inner(
             }
         };
         match load_launch_context(&conn, &profile_id) {
-            Ok((p, proxy)) => {
+            Ok((p, proxy, trim)) => {
                 if p.status == "running" {
                     return LaunchResult {
                         profile_id,
@@ -211,7 +214,7 @@ async fn do_launch_inner(
                         message: "Profile is already running".into(),
                     };
                 }
-                (p, proxy)
+                (p, proxy, trim)
             }
             Err(e) => {
                 return LaunchResult { profile_id, success: false, message: e.to_string() }
@@ -224,7 +227,7 @@ async fn do_launch_inner(
     let spec_state = state.inner().clone();
     let spec_profile = profile.clone();
     let spec = match tauri::async_runtime::spawn_blocking(move || {
-        build_launch_spec_blocking(&spec_state, &spec_profile, proxy_row)
+        build_launch_spec_blocking(&spec_state, &spec_profile, proxy_row, trim_memory)
     })
     .await
     {

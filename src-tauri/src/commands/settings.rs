@@ -27,6 +27,10 @@ pub struct Settings {
     /// Tag (group) id -> niri workspace number, used by the window-rules
     /// generator: profiles carrying the tag open on that workspace.
     pub group_workspaces: HashMap<String, i64>,
+    /// Launch browsers in memory-trim ("lightweight") mode: append curated
+    /// RAM-saving flags (process-per-site, no media router/translate/sync
+    /// services, ...). Default on — farm/kiosk profiles rarely want them.
+    pub lightweight_browsers: bool,
 }
 
 impl Default for Settings {
@@ -38,6 +42,7 @@ impl Default for Settings {
             auto_backup_keep: 10,
             default_browser_type: "chromium".into(),
             group_workspaces: HashMap::new(),
+            lightweight_browsers: true,
         }
     }
 }

@@ -133,6 +133,8 @@ export interface AppSettings {
   autoBackupKeep: number;
   defaultBrowserType: string;
   groupWorkspaces: Record<string, number>;
+  /** Memory-trim launch mode: append curated RAM-saving flags. */
+  lightweightBrowsers: boolean;
 }
 
 export interface WindowRule {

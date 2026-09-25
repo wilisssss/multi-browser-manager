@@ -94,6 +94,24 @@ export function SettingsModal({ onClose, onSaved }: Props) {
               />
             </div>
 
+            {/* Memory */}
+            <label className="flex items-start gap-2 text-sm font-medium">
+              <input
+                type="checkbox"
+                checked={settings.lightweightBrowsers}
+                onChange={(e) => set("lightweightBrowsers", e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-blue-600"
+              />
+              <span>
+                Hemat RAM (mode ringan)
+                <span className="mt-0.5 block text-xs font-normal text-neutral-500 dark:text-neutral-400">
+                  Meluncurkan browser dengan flag penyetel memori: satu renderer
+                  per situs, tanpa media router / translate / sync / prediksi
+                  jaringan. Berlaku di launch berikutnya.
+                </span>
+              </span>
+            </label>
+
             {/* History */}
             <div className="grid grid-cols-2 gap-3">
               <div>
