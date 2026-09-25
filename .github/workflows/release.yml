@@ -45,6 +45,10 @@ jobs:
             patchelf \
             file
 
+      # tauri-action tidak meng-install dependensi frontend otomatis
+      - name: Install frontend dependencies
+        run: npm ci
+
       - name: Build & release
         uses: tauri-apps/tauri-action@v0
         env:
