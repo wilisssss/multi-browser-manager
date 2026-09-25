@@ -77,6 +77,10 @@ pub fn build_args(spec: &LaunchSpec) -> Vec<String> {
 
     if spec.trim_memory {
         args.extend(MEMORY_TRIM_FLAGS.iter().map(|s| s.to_string()));
+        args.push(format!(
+            "--enable-features={}",
+            MEMORY_TRIM_ENABLE_FEATURES.join(",")
+        ));
     }
 
     if let Some(ext) = &spec.extension_path {
@@ -103,6 +107,8 @@ const MEMORY_TRIM_FEATURES: &[&str] = &[
     "InterestFeedContentSuggestions",
     // Back/forward cache keeps frozen pages alive in RAM.
     "BackForwardCache",
+    // Audio utility process back into the browser process.
+    "AudioServiceOutOfProcess",
 ];
 
 /// Command-line flags for the memory-trim launch mode (feature toggles live
@@ -123,6 +129,12 @@ const MEMORY_TRIM_FLAGS: &[&str] = &[
     "--disable-background-networking",
     "--disable-default-apps",
 ];
+
+/// Features ENABLED in trim mode: the network utility process merges into
+/// the browser process (one fewer process per profile). `--enable-features`
+/// is a separate flag from `--disable-features` and Chromium keeps only the
+/// last occurrence of each, so both are assembled in one place.
+const MEMORY_TRIM_ENABLE_FEATURES: &[&str] = &["NetworkServiceInProcess"];
 
 /// Flags MBM must keep under its own control: they define the isolation and
 /// identity of a profile, and letting a per-profile arg override them would
@@ -441,6 +453,7 @@ mod tests {
         let off = build_args(&base_spec());
         assert!(!off.iter().any(|a| a.contains("process-per-site")));
         assert!(!off.iter().any(|a| a.starts_with("--disable-features")));
+        assert!(!off.iter().any(|a| a.starts_with("--enable-features")));
 
         let mut spec = base_spec();
         spec.trim_memory = true;
@@ -453,6 +466,13 @@ mod tests {
             .unwrap();
         for f in MEMORY_TRIM_FEATURES {
             assert!(features.contains(f), "{f} must be in the merged flag");
+        }
+        let enabled = on
+            .iter()
+            .find(|a| a.starts_with("--enable-features="))
+            .unwrap();
+        for f in MEMORY_TRIM_ENABLE_FEATURES {
+            assert!(enabled.contains(f), "{f} must be in the enable flag");
         }
     }
 

@@ -30,7 +30,17 @@ pub struct Settings {
     /// Launch browsers in memory-trim ("lightweight") mode: append curated
     /// RAM-saving flags (process-per-site, no media router/translate/sync
     /// services, ...). Default on — farm/kiosk profiles rarely want them.
+    /// Field-level default (not container-level): container serde default
+    /// fills a missing bool with `false`, silently switching the mode off
+    /// for settings rows saved before this field existed.
+    #[serde(default = "default_true")]
     pub lightweight_browsers: bool,
+}
+
+/// Serde default for opt-out-by-default booleans (`bool::default` is false,
+/// which is the wrong polarity for a default-on setting).
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -180,6 +190,9 @@ mod tests {
         assert_eq!(s4.history_retention_days, 7);
         assert_eq!(s4.history_max_entries, 1000);
         assert!(s4.auto_backup);
+        // Regression: a pre-lightweight row must default the mode ON
+        // (container-level serde default would yield false for a bool).
+        assert!(s4.lightweight_browsers);
     }
 
     #[test]
