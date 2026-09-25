@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { Loader2, Settings as SettingsIcon, X } from "lucide-react";
-import { getBackupDir, getSettings, updateSettings } from "../lib/tauri-api";
+import { Loader2, Settings as SettingsIcon, Trash2, X } from "lucide-react";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { emptyTrash, getBackupDir, getSettings, getTrashCount, updateSettings } from "../lib/tauri-api";
 import type { AppSettings } from "../types";
 
 interface Props {
@@ -12,6 +13,8 @@ interface Props {
 export function SettingsModal({ onClose, onSaved }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [backupDir, setBackupDir] = useState("");
+  const [trashCount, setTrashCount] = useState<number | null>(null);
+  const [emptyingTrash, setEmptyingTrash] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -22,7 +25,27 @@ export function SettingsModal({ onClose, onSaved }: Props) {
     getBackupDir()
       .then(setBackupDir)
       .catch(() => {});
+    getTrashCount()
+      .then(setTrashCount)
+      .catch(() => {});
   }, []);
+
+  const handleEmptyTrash = async () => {
+    const ok = await ask(
+      "Permanently delete all trashed profiles and their data folders? This cannot be undone.",
+      { title: "Empty trash", kind: "warning", okLabel: "Delete forever", cancelLabel: "Cancel" },
+    );
+    if (!ok) return;
+    setEmptyingTrash(true);
+    try {
+      await emptyTrash();
+      setTrashCount(0);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setEmptyingTrash(false);
+    }
+  };
 
   const set = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) =>
     setSettings((s) => (s ? { ...s, [key]: value } : s));
@@ -124,6 +147,28 @@ export function SettingsModal({ onClose, onSaved }: Props) {
               {backupDir && (
                 <p className="break-all font-mono text-xs text-neutral-400">Folder: {backupDir}</p>
               )}
+            </div>
+
+            {/* Trash (feature 6) */}
+            <div className="flex items-center justify-between rounded-lg border border-neutral-200 px-3 py-2.5 dark:border-neutral-800">
+              <div className="text-sm">
+                <p className="font-medium">Trash</p>
+                <p className="text-xs text-neutral-500 dark:text-neutral-400">
+                  {trashCount === null
+                    ? "Deleted profiles are kept 30 days."
+                    : trashCount === 0
+                      ? "Empty — deleted profiles are kept 30 days."
+                      : `${trashCount} deleted profile${trashCount > 1 ? "s" : ""} (kept 30 days).`}
+                </p>
+              </div>
+              <button
+                onClick={handleEmptyTrash}
+                disabled={emptyingTrash || !trashCount}
+                className="flex shrink-0 items-center gap-1.5 rounded-lg border border-red-300 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-40 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950/40"
+              >
+                {emptyingTrash ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                Empty
+              </button>
             </div>
 
             {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}

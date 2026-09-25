@@ -175,7 +175,7 @@ fn get_credential(conn: &Connection, id: &str) -> AppResult<Credential> {
     )
     .map_err(|e| match e {
         rusqlite::Error::QueryReturnedNoRows => {
-            AppError::NotFound(format!("Credential {id} not found"))
+            AppError::not_found(format!("Credential {id} not found"))
         }
         other => other.into(),
     })
@@ -221,7 +221,7 @@ pub fn create_credential(
 ) -> AppResult<Credential> {
     let platform = input.platform.trim().to_string();
     if platform.is_empty() {
-        return Err(AppError::Validation("Platform is required".into()));
+        return Err(AppError::validation("Platform is required"));
     }
     // Label falls back to the platform name (the UI already shows icons).
     let label = {
@@ -240,7 +240,7 @@ pub fn create_credential(
         |r| r.get(0),
     )?;
     if !exists {
-        return Err(AppError::NotFound(format!("Profile {profile_id} not found")));
+        return Err(AppError::not_found(format!("Profile {profile_id} not found")));
     }
 
     conn.execute(

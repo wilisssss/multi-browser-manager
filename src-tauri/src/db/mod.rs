@@ -7,12 +7,31 @@ pub mod migrations {
         (3, include_str!("migrations/0003_settings.sql")),
         (4, include_str!("migrations/0004_credentials.sql")),
         (5, include_str!("migrations/0005_credentials_secrets.sql")),
+        (6, include_str!("migrations/0006_extra_args_trash.sql")),
     ];
 }
 
 use crate::error::AppResult;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
+
+/// Opens the existing database READ-ONLY for out-of-process readers
+/// (`mbm --list`). Never creates the file and never migrates it: running
+/// migrations here could race with the app's own migration pass at startup
+/// (both see version 0, both ALTER the same column → "duplicate column" and
+/// a hard failure). A missing DB simply means "nothing configured yet".
+pub fn open_readonly(db_path: &Path) -> AppResult<Option<Connection>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Wait instead of failing if the app happens to hold the write lock.
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    Ok(Some(conn))
+}
 
 /// Opens (or creates) the SQLite database at `db_path` and applies pending migrations.
 pub fn init(db_path: &Path) -> AppResult<Connection> {

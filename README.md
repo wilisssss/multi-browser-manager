@@ -9,7 +9,7 @@ Dibangun dengan **Tauri v2 (Rust)** + **React + Vite + TailwindCSS**.
 - **CRUD profile** dengan isolasi data penuh (per-profile `user-data-dir`, permission `700` di Linux)
 - **Launch / stop browser** per profile, dengan deteksi otomatis saat browser ditutup manual (event `profile-stopped`)
 - **Bulk launch / stop** — tombol "Launch all" / "Stop all" di toolbar
-- **System tray** — tutup window hanya menyembunyikan dashboard (browser tetap di-watch); menu tray: Show Dashboard, toggle launch/stop per profile (● running / ○ stopped), Quit. Ikon tray muncul di status bar apa pun yang mendukung SNI (QuickShell, Waybar, dst.). Butuh `libayatana-appindicator` di Linux; tanpa itu app tetap jalan (tray dilewati).
+- **System tray** — tutup window hanya menyembunyikan dashboard (browser tetap di-watch); menu tray: Show Dashboard, toggle launch/stop per profile (● running / ○ stopped), **Stop all browsers**, Quit. Ikon tray muncul di status bar apa pun yang mendukung SNI (QuickShell, Waybar, dst.). Butuh `libayatana-appindicator` di Linux; tanpa itu app tetap jalan (tray dilewati). Rebuild menu di-debounce lewat satu worker thread.
 - **Tags / groups** — beri label berwarna pada profile, filter by tag di toolbar
 - **Pin profile** — profile yang di-pin selalu di atas (urutan: pinned → nama)
 - **Deteksi browser** terinstall (Linux / Windows / macOS), termasuk versi
@@ -20,12 +20,16 @@ Dibangun dengan **Tauri v2 (Rust)** + **React + Vite + TailwindCSS**.
 - **Password proxy di OS keychain** (Secret Service / Keychain / Credential Manager) — tidak pernah plaintext di SQLite
 - **Credentials per profile** — manajer akun sosial media untuk farming: X (Twitter), Facebook, Discord, Google/Gmail, Instagram, TikTok, Reddit, Telegram, EVM/Bitcoin wallet, + custom
   - Tombol 🔑 di setiap kartu profile → list akun → detail per akun
-  - Password, seed phrase & EVM address tersimpan di database lokal (penggunaan pribadi; folder data `0700`) dan **ikut di export/import** untuk migrasi antar device
+  - Password, seed phrase & EVM address tersimpan **plaintext di database lokal** (desain sadar untuk penggunaan pribadi: data terproteksi permission folder `0700`, bukan OS keychain) dan **ikut di export/import** untuk migrasi antar device. Jangan export file backup ke tempat yang tidak kamu percaya — siapa pun yang punya file itu punya semua akunmu.
   - Platform picker dengan icon brand; field mengikuti template platform; copy password/seed phrase satu klik dari list
   - Duplicate profile ikut menyalin kredensial; delete profile membersihkan semuanya
-- **Export / import** konfigurasi profile + proxy + tags (JSON, tanpa password)
-- **Delete profile = wipe data** — folder `user-data-dir` benar-benar dihapus dari disk
-- **Orphan recovery** — browser yang tertinggal dari sesi sebelumnya terdeteksi saat startup (status `running` kembali benar) dan tetap bisa di-stop
+- **Export / import** konfigurasi profile + proxy + tags + credentials (JSON), **opsi terenkripsi passphrase** (Argon2id + AES-256-GCM): file terenkripsi tidak bisa dibaca tanpa passphrase; import file terenkripsi otomatis meminta passphrase. Password proxy tidak ikut; **secret kredensial ikut** (lihat peringatan di Credentials) — simpan file backup hanya di tempat terpercaya.
+- **Extra launch args per profile** — power-user bisa menambah argumen CLI browser (`--disable-gpu`, `--start-maximized`, URL awal, dst.); flag yang dikelola MBM (`--user-data-dir`, `--proxy-server`, `--load-extension`, `--class`) ditolak saat simpan.
+- **Resource usage per profile** — RAM/CPU seluruh process tree browser yang sedang jalan (Linux, via `/proc`), panel Resources di toolbar + badge live di kartu.
+- **Statistik usage** — total jam sesi per profile dari launch history; sorting "Most used" + badge di kartu.
+- **Restart on crash & stop timeout per profile** — profile farming bisa di-set auto-restart (maks 3x per sesi launch) saat browser exit tidak wajar, plus grace period stop per profile (default 3 detik).
+- **Delete ke trash (undo)** — delete memindahkan folder data ke trash + snapshot profile/kredensial; banner Undo 30 detik, snapshot dibersihkan otomatis setelah 30 hari; "Empty trash" ada di Settings.
+- **Orphan recovery** — browser yang tertinggal dari sesi sebelumnya terdeteksi saat startup (status `running` kembali benar) dan tetap bisa di-stop. Deteksi ini mengandalkan symlink `SingletonLock` + `/proc` sehingga **hanya berfungsi di Linux**; di Windows/macOS profile yang tertinggal tetap bisa di-launch ulang dengan aman (data tidak korup), hanya statusnya tidak otomatis dikoreksi.
 - **Notifikasi desktop untuk CLI** — kegagalan `--launch`/`--stop` dari keybind WM muncul sebagai notifikasi, bukan hanya stderr
 - **Dark / light theme** dengan toggle (`T`) + persist di localStorage; dropdown custom (bukan `<select>` native) agar popup selaras dengan dark mode
 - **Keyboard shortcuts** in-app (tekan `?` di dashboard untuk daftar)
@@ -33,7 +37,7 @@ Dibangun dengan **Tauri v2 (Rust)** + **React + Vite + TailwindCSS**.
 - **Launch history** (tombol History / `H`) — durasi sesi per profile
 - **Auto-updater** — cek update via tombol di header (tauri-plugin-updater)
 - **Settings** — retensi & batas launch history, backup otomatis on/off + jumlah snapshot, default browser type untuk profile baru
-- **Auto-snapshot backup** — sekali sehari (jika berubah) snapshot profile+proxy (tanpa password) ke `~/.local/share/multibrowsermanager/backups/`, auto-prune
+- **Auto-snapshot backup** — sekali sehari (jika berubah) snapshot profile+proxy+credentials ke `~/.local/share/multibrowsermanager/backups/`, auto-prune. Folder data sudah `0700`, tapi ingat snapshot berisi secret kredensial (lihat peringatan Credentials).
 - **Window rules & workspaces niri** — setiap browser diluncurkan dengan app-id unik (`--class`/`--wayland-app-id` = `mbm-<nama>-<id>`); modal khusus menampilkan app-id per profile, mapping tag → workspace, dan generator snippet `window-rule { match app-id=... open-on-workspace ... }`
 - **CLI + WM keybinds** — launch/stop profile langsung dari keybind compositor (niri, dst.), fuzzel menu dengan indikator status ●/○
 
@@ -74,11 +78,13 @@ src-tauri/src/
 ├── db/                     # rusqlite + migrations
 ├── models/                 # Profile, Proxy structs
 ├── proxy_manager.rs        # keychain, extension generator, proxy test
+├── startup.rs              # rekonsiliasi status & prune history (unit-tested)
 └── error.rs                # error type serializable ke IPC
 
 src/                        # frontend React
-├── components/             # Dashboard, ProfileList, ProfileCard, ProfileForm, ProxyManager
-├── hooks/                  # useProfiles, useProxies
+├── components/             # Dashboard (orchestrator), DashboardHeader, Toolbar,
+│                           # Banners, ProfileList/Card, ProfileForm, ProxyManager, dst.
+├── hooks/                  # useProfiles, useProxies, useProfileFilters (search+filter+sort)
 └── lib/tauri-api.ts        # typed invoke wrappers
 ```
 
@@ -112,17 +118,21 @@ npm run app   # = npm run build + cargo build --features custom-protocol
 ## Testing
 
 ```bash
-cd src-tauri && cargo test   # unit test: launcher args, extension generator, detector
+cd src-tauri && cargo test   # unit test: launcher args, crypto backup, import/trash engine, resources, settings, proses
+npx tsc --noEmit             # type-check frontend
+npm test                     # unit test frontend (format helper)
 npm run build                # type-check + build frontend
 ```
 
 ## Catatan penting
 
 - **Chrome branded 137+** membatasi flag `--load-extension`, jadi proxy **dengan autentikasi** mungkin tidak jalan di Chrome stable terbaru. Gunakan **Chromium atau Brave** untuk proxy auth, atau Chrome dev/canary. Proxy **tanpa** auth aman di semua browser (pakai `--proxy-server` biasa).
-- Password proxy hanya di memori saat generate extension dan dihapus dari disk (`tmp/mbm-proxy-ext/`) begitu profile berhenti.
+- Password proxy hanya di memori saat generate extension dan dihapus dari disk (`~/.cache/multibrowsermanager/proxy-ext/`) begitu profile berhenti; browser yang masih hidup saat MBM keluar tidak disapu ekstensinya (proxy auth-nya tetap berfungsi).
 - Saat startup, status tiap profile direkonsiliasi dengan kenyataan: browser orphan dari sesi sebelumnya (SingletonLock masih hidup) ditandai `running` kembali dan tetap bisa di-stop; lock dari browser yang sudah mati dibersihkan otomatis.
 - Tray di Linux butuh `libayatana-appindicator` (`sudo pacman -S libayatana-appindicator` di Arch). Tanpa paket itu app tetap jalan, hanya tanpa ikon tray.
 - Test proxy SOCKS5 dengan auth mengirim credential lewat URL (`socks5://user:pass@host:port`) — karakter khusus di password sebaiknya di-percent-encode.
+- Panel **Resource usage** hanya tersedia di Linux (dibaca dari `/proc`); di OS lain daftarnya kosong dan badge RAM/CPU disembunyikan.
+- **CSP** produksi dikunci (`default-src 'self'` di `tauri.conf.json`) — webview tidak boleh memuat resource eksternal; ini menutup vektor XSS→ekfiltrasi secret kredensial dari modal credentials.
 
 ## Auto-updater (setup release)
 

@@ -30,9 +30,13 @@ pub fn delete_proxy_password(proxy_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Directory under the OS temp dir where per-profile proxy extensions are generated.
+/// Directory holding per-profile proxy extension folders. Lives under the
+/// user's cache dir — NOT the shared /tmp, where another user could
+/// pre-create the path and redirect or read generated credential files.
 pub fn extension_root() -> PathBuf {
-    std::env::temp_dir().join("mbm-proxy-ext")
+    directories::ProjectDirs::from("com", "mbm", "Multi Browser Manager")
+        .map(|dirs| dirs.cache_dir().join("proxy-ext"))
+        .unwrap_or_else(|| std::env::temp_dir().join("mbm-proxy-ext"))
 }
 
 /// Generates (or regenerates) an unpacked Chrome extension that configures the
@@ -159,10 +163,50 @@ pub fn cleanup_extension(profile_id: &str) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Removes the whole extension root — called on app exit so credential files
-/// never outlive the process (quit via tray, crash, SIGTERM, ...).
-pub fn cleanup_all_extensions() {
-    let _ = std::fs::remove_dir_all(extension_root());
+/// Removes generated extension directories, EXCEPT for profiles whose browser
+/// is still alive — deleting an extension under a live Chromium breaks its
+/// proxy auth when the service worker reloads.
+///
+/// A profile is considered alive when its id is in `running_profile_ids`
+/// (this session's tracked browsers) OR its DB row still says 'running' with
+/// a verified live SingletonLock (orphans from a previous session; this only
+/// holds on Linux, see `launcher::singleton_pid`). Everything else is swept
+/// so credential files never linger on disk.
+///
+/// Profile ids are UUIDs (hex + '-'), which `sanitize` leaves unchanged — so
+/// directory names match profile ids exactly.
+pub fn cleanup_all_extensions(running_profile_ids: &[String], db: &rusqlite::Connection) {
+    let root = extension_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return; // nothing was ever generated this session
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Some(id) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let tracked = running_profile_ids.iter().any(|r| r == &id);
+        let alive_by_lock = db
+            .query_row(
+                "SELECT user_data_dir FROM profiles WHERE id = ?1 AND status = 'running'",
+                rusqlite::params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .map(|data_dir| {
+                crate::browser::launcher::singleton_pid(std::path::Path::new(&data_dir))
+                    .filter(|pid| {
+                        crate::browser::launcher::pid_alive(*pid)
+                            && crate::browser::launcher::pid_cmdline_contains(*pid, &data_dir)
+                    })
+                    .is_some()
+            })
+            .unwrap_or(false);
+        if tracked || alive_by_lock {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn sanitize(id: &str) -> String {
@@ -253,7 +297,7 @@ pub fn ensure_valid_protocol(p: &str) -> AppResult<()> {
     if is_supported_protocol(p) {
         Ok(())
     } else {
-        Err(AppError::Validation(format!(
+        Err(AppError::validation(format!(
             "Unsupported proxy protocol: {p} (expected http or socks5)"
         )))
     }

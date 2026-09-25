@@ -1,21 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AppSettings,
   BrowserInfo,
+  CreateCredentialInput,
   CreateProfileInput,
   CreateProxyInput,
+  Credential,
+  DeletedProfileInfo,
   Group,
   ImportResult,
   LaunchResult,
   Profile,
   Proxy,
   ProxyTestResult,
+  ResourceUsage,
+  UpdateCredentialInput,
   UpdateProfileInput,
   UpdateProxyInput,
-  AppSettings,
+  UsageStat,
   WindowRule,
-  Credential,
-  CreateCredentialInput,
-  UpdateCredentialInput,
 } from "../types";
 
 // Profile
@@ -24,7 +27,13 @@ export const createProfile = (input: CreateProfileInput) =>
   invoke<Profile>("create_profile", { input });
 export const updateProfile = (id: string, input: UpdateProfileInput) =>
   invoke<Profile>("update_profile", { id, input });
-export const deleteProfile = (id: string) => invoke<void>("delete_profile", { id });
+/** Deletes to the trash (recoverable for 30 days); returns undo info. */
+export const deleteProfile = (id: string) =>
+  invoke<DeletedProfileInfo>("delete_profile", { id });
+export const restoreProfile = (id: string) =>
+  invoke<Profile>("restore_profile", { id });
+export const getTrashCount = () => invoke<number>("get_trash_count");
+export const emptyTrash = () => invoke<number>("empty_trash");
 export const duplicateProfile = (id: string) =>
   invoke<Profile>("duplicate_profile", { id });
 export const togglePin = (id: string) => invoke<boolean>("toggle_pin", { id });
@@ -40,7 +49,9 @@ export const launchProfile = (id: string) => invoke<LaunchResult>("launch_profil
 export const stopProfile = (id: string) => invoke<void>("stop_profile", { id });
 export const bulkLaunch = (ids: string[]) => invoke<LaunchResult[]>("bulk_launch", { ids });
 export const bulkStop = (ids: string[]) => invoke<LaunchResult[]>("bulk_stop", { ids });
-export const getRunningProfiles = () => invoke<string[]>("get_running_profiles");
+// Resource usage (Linux only — an empty list means "not available").
+export const getResourceUsage = () => invoke<ResourceUsage[]>("get_resource_usage");
+export const getUsageStats = () => invoke<UsageStat[]>("get_usage_stats");
 
 // Launch history
 export interface HistoryEntry {
@@ -66,7 +77,10 @@ export const testProxy = (id: string) => invoke<ProxyTestResult>("test_proxy", {
 
 // Backup
 export const exportProfiles = (path: string) => invoke<void>("export_profiles", { path });
-export const importProfiles = (path: string) => invoke<ImportResult>("import_profiles", { path });
+export const exportProfilesEncrypted = (path: string, passphrase: string) =>
+  invoke<void>("export_profiles_encrypted", { path, passphrase });
+export const importProfiles = (path: string, passphrase?: string) =>
+  invoke<ImportResult>("import_profiles", { path, passphrase: passphrase ?? null });
 
 // Settings
 export const getSettings = () => invoke<AppSettings>("get_settings");

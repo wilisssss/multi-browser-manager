@@ -12,6 +12,19 @@ pub struct BrowserInfo {
     pub version: Option<String>,
 }
 
+/// Whether `browser_type` is one of the types this build can actually detect
+/// and launch. Used to validate IPC-supplied types (create/update profile):
+/// an arbitrary string would otherwise silently produce a profile that can
+/// never be launched.
+pub fn is_known_browser_type(browser_type: &str) -> bool {
+    CANDIDATES.iter().any(|c| c.browser_type == browser_type)
+}
+
+/// All browser types this build knows about (for validation error messages).
+pub fn known_browser_types() -> Vec<&'static str> {
+    CANDIDATES.iter().map(|c| c.browser_type).collect()
+}
+
 /// Detect installed Chromium-based browsers on the current OS.
 pub fn detect_browsers() -> Vec<BrowserInfo> {
     let mut found = detect_for_platform();

@@ -94,8 +94,10 @@ export function useProfiles() {
   );
 
   const remove = useCallback(async (id: string) => {
-    await deleteProfile(id);
+    // Returns undo info (F6): the profile goes to the trash, not the void.
+    const info = await deleteProfile(id);
     setProfiles((prev) => prev.filter((p) => p.id !== id));
+    return info;
   }, []);
 
   const duplicate = useCallback(async (id: string) => {

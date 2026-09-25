@@ -16,6 +16,12 @@ export interface Profile {
   updatedAt: number;
   lastUsedAt: number | null;
   pinned: boolean;
+  /** Extra launch args, space-separated with double-quote support. */
+  extraArgs: string | null;
+  /** Re-launch automatically after an unexpected exit. */
+  restartOnCrash: boolean;
+  /** Graceful-stop window in seconds; null = 3 s default. */
+  stopTimeoutSecs: number | null;
   groups: Group[];
 }
 
@@ -24,6 +30,9 @@ export interface CreateProfileInput {
   browserType: string;
   proxyId: string | null;
   notes: string | null;
+  extraArgs?: string | null;
+  restartOnCrash?: boolean;
+  stopTimeoutSecs?: number | null;
 }
 
 export interface UpdateProfileInput {
@@ -31,6 +40,32 @@ export interface UpdateProfileInput {
   browserType?: string;
   proxyId?: string | null;
   notes?: string | null;
+  extraArgs?: string | null;
+  restartOnCrash?: boolean;
+  stopTimeoutSecs?: number | null;
+}
+
+/** Per-profile RAM/CPU usage of the running browser tree (Linux only). */
+export interface ResourceUsage {
+  profileId: string;
+  pid: number;
+  /** Resident memory of the whole process tree, in KiB. */
+  memoryKb: number;
+  /** CPU % since the previous sample; null on the first sample. */
+  cpuPercent: number | null;
+}
+
+/** Aggregate usage statistics per profile (from launch history). */
+export interface UsageStat {
+  profileId: string;
+  sessions: number;
+  seconds: number;
+}
+
+/** Returned by delete_profile so the UI can offer "Undo". */
+export interface DeletedProfileInfo {
+  id: string;
+  name: string;
 }
 
 export interface Proxy {

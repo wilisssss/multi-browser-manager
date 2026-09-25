@@ -8,6 +8,10 @@ interface Props {
   loading: boolean;
   /** O(1) proxy lookup shared by every card (built once per proxies change). */
   proxyById: Map<string, import("../types").Proxy>;
+  /** Live RAM/CPU per running profile id (feature 2), empty when not sampled. */
+  usageById?: Record<string, { memoryKb: number; cpuPercent: number | null }>;
+  /** Total browser seconds per profile id (feature 5). */
+  usageSeconds?: Record<string, number>;
   onLaunch: (id: string) => Promise<void>;
   onStop: (id: string) => Promise<void>;
   onEdit: (profile: Profile) => void;
@@ -23,6 +27,8 @@ export const ProfileList = memo(function ProfileList({
   profiles,
   loading,
   proxyById,
+  usageById,
+  usageSeconds,
   onLaunch,
   onStop,
   onEdit,
@@ -63,6 +69,8 @@ export const ProfileList = memo(function ProfileList({
           key={profile.id}
           profile={profile}
           proxy={profile.proxyId ? proxyById.get(profile.proxyId) ?? null : null}
+          usage={usageById?.[profile.id] ?? null}
+          totalSeconds={usageSeconds?.[profile.id] ?? null}
           onLaunch={onLaunch}
           onStop={onStop}
           onEdit={onEdit}

@@ -14,6 +14,9 @@ pub struct LaunchSpec {
     pub extension_path: Option<String>,
     /// Unique per-profile window class / Wayland app-id (`mbm-<name>-<id4>`).
     pub window_class: Option<String>,
+    /// Per-profile extra launch arguments (feature: launch-args editor),
+    /// already split into tokens by `parse_extra_args`.
+    pub extra_args: Vec<String>,
 }
 
 /// Stable, unique-per-profile window class / Wayland app-id:
@@ -61,7 +64,79 @@ pub fn build_args(spec: &LaunchSpec) -> Vec<String> {
         args.push("--disable-features=DisableLoadExtensionCommandLineSwitch".to_string());
     }
 
+    // Per-profile power-user arguments last, so users can see (but not
+    // override — those are blocked at save time) MBM's own flags above.
+    args.extend(spec.extra_args.iter().cloned());
+
     args
+}
+
+/// Flags MBM must keep under its own control: they define the isolation and
+/// identity of a profile, and letting a per-profile arg override them would
+/// merge profiles' data or break window rules.
+const BLOCKED_EXTRA_ARG_PREFIXES: &[&str] = &[
+    "--user-data-dir",
+    "--user-data",
+    "--profile-directory",
+    "--proxy-server",
+    "--proxy-pac-url",
+    "--proxy-bypass",
+    "--load-extension",
+    "--class",
+    "--wayland-app-id",
+    "--no-startup-window",
+];
+
+/// Parses a per-profile extra-args string into tokens. Splitting is
+/// whitespace-based with double-quote grouping so values with spaces work:
+/// `--proxy-server="http://a b"` … well, flags like these are blocked, but
+/// e.g. `--host-resolver-rules="MAP * 1.2.3.4"` survives intact.
+pub fn parse_extra_args(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_content = false;
+    for ch in raw.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_content = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_content {
+                    tokens.push(std::mem::take(&mut current));
+                    has_content = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_content = true;
+            }
+        }
+    }
+    if has_content {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Validates a per-profile extra-args string: parses it and rejects flags
+/// that would break MBM's isolation/identity guarantees. Returns the parsed
+/// tokens on success.
+pub fn validate_extra_args(raw: &str) -> AppResult<Vec<String>> {
+    let tokens = parse_extra_args(raw);
+    for token in &tokens {
+        let lowered = token.to_ascii_lowercase();
+        if BLOCKED_EXTRA_ARG_PREFIXES
+            .iter()
+            .any(|p| lowered == *p || lowered.starts_with(&format!("{p}=")))
+        {
+            return Err(crate::error::AppError::validation(format!(
+                "Argument '{token}' is managed by MBM and cannot be overridden"
+            )));
+        }
+    }
+    Ok(tokens)
 }
 
 /// Spawns the browser process detached from our lifecycle concerns beyond the
@@ -81,8 +156,13 @@ pub fn spawn(spec: &LaunchSpec) -> AppResult<Child> {
 }
 
 /// Parses the Chromium `SingletonLock` symlink inside a user-data-dir and
-/// returns the pid of the browser instance that owns it (unix only).
-pub fn singleton_pid(user_data_dir: &Path) -> Option<i32> {
+/// returns the pid of the browser instance that owns it.
+///
+/// Linux-only in practice: the lock is a symlink whose target encodes the pid,
+/// and pid verification reads `/proc`. On other platforms this returns `None`,
+/// so orphan-recovery features (startup reconciliation, stop-by-lock) degrade
+/// to "not detected" there while launch/stop within a session stay accurate.
+pub fn singleton_pid(user_data_dir: &Path) -> Option<u32> {
     let lock = user_data_dir.join("SingletonLock");
     let target = std::fs::read_link(lock).ok()?;
     let target_str = target.to_string_lossy();
@@ -91,13 +171,38 @@ pub fn singleton_pid(user_data_dir: &Path) -> Option<i32> {
     pid_str.parse().ok()
 }
 
-/// Whether a process with this pid exists (unix, via /proc).
-pub fn pid_alive(pid: i32) -> bool {
+/// Whether a process with this pid exists.
+/// Unix: check `/proc/<pid>`. Windows: OpenProcess + GetExitCodeProcess
+/// (still-running processes report the dedicated STILL_ACTIVE sentinel).
+/// Declared inline to avoid a windows crate dependency.
+pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Returns false on platforms without /proc-based helpers.
+        #[allow(non_snake_case)]
+        extern "system" {
+            fn OpenProcess(desiredAccess: u32, inheritHandle: i32, processId: u32) -> *mut core::ffi::c_void;
+            fn GetExitCodeProcess(process: *mut core::ffi::c_void, exitCode: *mut u32) -> i32;
+            fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut exit_code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            ok != 0 && exit_code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -106,7 +211,7 @@ pub fn pid_alive(pid: i32) -> bool {
 
 /// Whether the process's cmdline references `needle` — used to verify a pid
 /// really belongs to the browser of a given user-data-dir before acting on it.
-pub fn pid_cmdline_contains(pid: i32, needle: &str) -> bool {
+pub fn pid_cmdline_contains(pid: u32, needle: &str) -> bool {
     #[cfg(unix)]
     {
         std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
@@ -145,6 +250,7 @@ mod tests {
             proxy_server: None,
             extension_path: None,
             window_class: None,
+            extra_args: vec![],
         };
         let args = build_args(&spec);
         assert!(args.contains(&"--user-data-dir=/tmp/mbm/p1".to_string()));
@@ -162,6 +268,7 @@ mod tests {
             proxy_server: Some("socks5://10.0.0.1:1080".into()),
             extension_path: None,
             window_class: None,
+            extra_args: vec![],
         };
         let args = build_args(&spec);
         assert!(args.contains(&"--proxy-server=socks5://10.0.0.1:1080".to_string()));
@@ -176,6 +283,7 @@ mod tests {
             proxy_server: None,
             extension_path: Some("/tmp/mbm-ext/p1".into()),
             window_class: None,
+            extra_args: vec![],
         };
         let args = build_args(&spec);
         assert!(args.contains(&"--load-extension=/tmp/mbm-ext/p1".to_string()));
@@ -191,6 +299,7 @@ mod tests {
             proxy_server: None,
             extension_path: None,
             window_class: Some("mbm-work-ab12".into()),
+            extra_args: vec![],
         };
         let args = build_args(&spec);
         assert!(args.contains(&"--class=mbm-work-ab12".to_string()));
@@ -208,5 +317,52 @@ mod tests {
         assert_eq!(window_app_id(id, "中文"), "mbm-profile-a1b2");
         // Stable across calls.
         assert_eq!(window_app_id(id, "Work"), window_app_id(id, "Work"));
+    }
+
+    #[test]
+    fn extra_args_are_parsed_with_quote_support() {
+        assert!(parse_extra_args("").is_empty());
+        assert!(parse_extra_args("   ").is_empty());
+        assert_eq!(parse_extra_args("--disable-gpu"), vec!["--disable-gpu"]);
+        assert_eq!(
+            parse_extra_args("--disable-gpu  --start-maximized"),
+            vec!["--disable-gpu", "--start-maximized"]
+        );
+        assert_eq!(
+            parse_extra_args("--host-resolver-rules=\"MAP * 1.2.3.4\""),
+            vec!["--host-resolver-rules=MAP * 1.2.3.4"]
+        );
+        // Unterminated quote: the rest is one token, no panic.
+        assert_eq!(parse_extra_args("--flag=\"open"), vec!["--flag=open"]);
+    }
+
+    #[test]
+    fn extra_args_append_to_built_args() {
+        let spec = LaunchSpec {
+            executable_path: "/usr/bin/chromium".into(),
+            user_data_dir: "/tmp/mbm/p1".into(),
+            proxy_server: None,
+            extension_path: None,
+            window_class: None,
+            extra_args: vec!["--disable-gpu".into(), "--start-maximized".into()],
+        };
+        let args = build_args(&spec);
+        let pos = args.iter().position(|a| a == "--disable-gpu").unwrap();
+        assert!(args[pos..].contains(&"--start-maximized".to_string()));
+        assert!(pos > 0, "extra args come after MBM's own flags");
+    }
+
+    #[test]
+    fn extra_args_blocklist_protects_mbm_invariants() {
+        assert!(validate_extra_args("--disable-gpu").is_ok());
+        for blocked in [
+            "--user-data-dir=/tmp/evil",
+            "--proxy-server=1.2.3.4",
+            "--load-extension=/tmp/ext",
+            "--class=rogue",
+            "--wayland-app-id=rogue",
+        ] {
+            assert!(validate_extra_args(blocked).is_err(), "{blocked} must be blocked");
+        }
     }
 }

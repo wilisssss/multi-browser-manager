@@ -36,9 +36,13 @@ directories = "5"
 keyring = { version = "3", features = ["sync-secret-service"] }
 reqwest = { version = "0.12", default-features = false, features = ["socks", "json", "rustls-tls", "http2"] }
 thiserror = "1"
-anyhow = "1"
 notify-rust = "4"
 percent-encoding = "2"
+# Encrypted backup export (feature): argon2id KDF + AES-256-GCM.
+aes-gcm = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+getrandom = "0.2"
 
 [profile.release]
 panic = "abort"

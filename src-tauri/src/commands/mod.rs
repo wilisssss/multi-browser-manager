@@ -5,20 +5,20 @@ pub mod process;
 pub mod profile;
 pub mod proxy;
 pub mod settings;
-pub mod window_rules;
 
 use crate::browser::detector::{self, BrowserInfo};
-
-/// Re-export the raw command functions for convenience.
-pub use backup::{export_profiles, import_profiles};
-pub use process::{bulk_launch, bulk_stop, get_running_profiles, launch_profile, stop_profile};
-pub use profile::{
-    create_profile, delete_profile, duplicate_profile, get_profiles, update_profile,
-};
-pub use proxy::{create_proxy, delete_proxy, get_proxies, test_proxy, update_proxy};
+use crate::AppState;
 
 /// Tauri command wrapper for browser detection.
+///
+/// Takes state so the executable cache (L5) is invalidated on every explicit
+/// detection: a browser installed/uninstalled while MBM runs must be picked
+/// up without an app restart. (The cache only accelerates launches between
+/// such UI calls.)
 #[tauri::command]
-pub fn detect_browsers() -> Vec<BrowserInfo> {
+pub fn detect_browsers(state: tauri::State<'_, AppState>) -> Vec<BrowserInfo> {
+    if let Ok(mut cache) = state.browser_cache.lock() {
+        cache.clear();
+    }
     detector::detect_browsers()
 }

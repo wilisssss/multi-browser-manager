@@ -1,4 +1,4 @@
-use crate::browser::launcher;
+use crate::browser::{detector, launcher};
 use crate::error::{AppError, AppResult};
 use crate::models::group::Group;
 use crate::models::profile::{CreateProfileInput, Profile, UpdateProfileInput};
@@ -20,6 +20,9 @@ fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<Profile> {
         updated_at: row.get("updated_at")?,
         last_used_at: row.get("last_used_at")?,
         pinned: row.get::<_, i64>("pinned")? != 0,
+        extra_args: row.get("extra_args")?,
+        restart_on_crash: row.get::<_, i64>("restart_on_crash")? != 0,
+        stop_timeout_secs: row.get("stop_timeout_secs")?,
         groups: Vec::new(),
     })
 }
@@ -71,7 +74,7 @@ pub fn get_profile_by_id(conn: &Connection, id: &str) -> AppResult<Profile> {
     conn.query_row("SELECT * FROM profiles WHERE id = ?1", params![id], row_to_profile)
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => {
-                AppError::NotFound(format!("Profile {id} not found"))
+                AppError::not_found(format!("Profile {id} not found"))
             }
             other => other.into(),
         })
@@ -80,7 +83,7 @@ pub fn get_profile_by_id(conn: &Connection, id: &str) -> AppResult<Profile> {
 fn validate_name(conn: &Connection, name: &str, exclude_id: Option<&str>) -> AppResult<()> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(AppError::Validation("Profile name cannot be empty".into()));
+        return Err(AppError::validation("Profile name cannot be empty"));
     }
 
     let exists: bool = conn.query_row(
@@ -92,7 +95,7 @@ fn validate_name(conn: &Connection, name: &str, exclude_id: Option<&str>) -> App
     )?;
 
     if exists {
-        return Err(AppError::Validation(format!(
+        return Err(AppError::validation(format!(
             "A profile named '{name}' already exists"
         )));
     }
@@ -100,10 +103,36 @@ fn validate_name(conn: &Connection, name: &str, exclude_id: Option<&str>) -> App
     Ok(())
 }
 
+/// Validates fields shared by create and update (audit L6): browser_type must
+/// be one this build can actually detect/launch, and extra args must parse
+/// and not override MBM's own flags.
+fn validate_launch_fields(browser_type: &str, extra_args: Option<&str>) -> AppResult<()> {
+    if !detector::is_known_browser_type(browser_type) {
+        return Err(AppError::validation(format!(
+            "Unknown browser type '{browser_type}'. Supported: {}",
+            detector::known_browser_types().join(", ")
+        )));
+    }
+    launcher::validate_extra_args(extra_args.unwrap_or(""))?;
+    Ok(())
+}
+
+/// Validates a per-profile stop timeout if present (1..=60 seconds).
+fn validate_stop_timeout(secs: Option<i64>) -> AppResult<()> {
+    if let Some(s) = secs {
+        if !(1..=60).contains(&s) {
+            return Err(AppError::validation(
+                "Stop timeout must be between 1 and 60 seconds",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn insert_profile(conn: &Connection, profile: &Profile) -> AppResult<()> {
     conn.execute(
-        "INSERT INTO profiles (id, name, browser_type, user_data_dir, proxy_id, notes, status, created_at, updated_at, last_used_at, pinned)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO profiles (id, name, browser_type, user_data_dir, proxy_id, notes, status, created_at, updated_at, last_used_at, pinned, extra_args, restart_on_crash, stop_timeout_secs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             profile.id,
             profile.name,
@@ -116,6 +145,9 @@ pub fn insert_profile(conn: &Connection, profile: &Profile) -> AppResult<()> {
             profile.updated_at,
             profile.last_used_at,
             profile.pinned as i64,
+            profile.extra_args,
+            profile.restart_on_crash as i64,
+            profile.stop_timeout_secs,
         ],
     )?;
     Ok(())
@@ -135,6 +167,8 @@ pub fn create_profile(
 ) -> AppResult<Profile> {
     let conn = db_lock(&state)?;
     validate_name(&conn, &input.name, None)?;
+    validate_launch_fields(&input.browser_type, input.extra_args.as_deref())?;
+    validate_stop_timeout(input.stop_timeout_secs)?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let user_data_dir = state
@@ -158,12 +192,15 @@ pub fn create_profile(
         updated_at: now,
         last_used_at: None,
         pinned: false,
+        extra_args: input.extra_args,
+        restart_on_crash: input.restart_on_crash,
+        stop_timeout_secs: input.stop_timeout_secs,
         groups: Vec::new(),
     };
 
     insert_profile(&conn, &profile)?;
-    drop(conn); // release the DB lock before the tray rebuilds itself
-    crate::tray::rebuild_tray(&app);
+    drop(conn); // release the DB lock before notifications fan out
+    crate::sync::after_profile_change(&app, &profile.id);
     Ok(profile)
 }
 
@@ -178,8 +215,8 @@ pub fn update_profile(
     let existing = get_profile_by_id(&conn, &id)?;
 
     if existing.status == "running" {
-        return Err(AppError::Validation(
-            "Cannot edit a profile while its browser is running".into(),
+        return Err(AppError::validation(
+            "Cannot edit a profile while its browser is running",
         ));
     }
 
@@ -193,12 +230,12 @@ pub fn update_profile(
             |r| r.get(0),
         )?;
         if !exists {
-            return Err(AppError::Validation(format!("Proxy {proxy_id} not found")));
+            return Err(AppError::validation(format!("Proxy {proxy_id} not found")));
         }
     }
 
     let name = input.name.unwrap_or(existing.name).trim().to_string();
-    let browser_type = input.browser_type.unwrap_or(existing.browser_type);
+    let browser_type = input.browser_type.unwrap_or(existing.browser_type.clone());
     // Absent = keep current; explicit null = clear (unassign proxy / clear notes).
     let proxy_id = match input.proxy_id {
         Some(v) => v,
@@ -208,51 +245,126 @@ pub fn update_profile(
         Some(v) => v,
         None => existing.notes,
     };
+    let extra_args = match input.extra_args {
+        Some(v) => v,
+        None => existing.extra_args.clone(),
+    };
+    let restart_on_crash = input.restart_on_crash.unwrap_or(existing.restart_on_crash);
+    let stop_timeout_secs = match input.stop_timeout_secs {
+        Some(v) => v,
+        None => existing.stop_timeout_secs,
+    };
+
+    validate_launch_fields(&browser_type, extra_args.as_deref())?;
+    validate_stop_timeout(stop_timeout_secs)?;
 
     conn.execute(
-        "UPDATE profiles SET name = ?1, browser_type = ?2, proxy_id = ?3, notes = ?4, updated_at = ?5 WHERE id = ?6",
-        params![name, browser_type, proxy_id, notes, chrono::Utc::now().timestamp(), id],
+        "UPDATE profiles SET name = ?1, browser_type = ?2, proxy_id = ?3, notes = ?4, extra_args = ?5, restart_on_crash = ?6, stop_timeout_secs = ?7, updated_at = ?8 WHERE id = ?9",
+        params![
+            name,
+            browser_type,
+            proxy_id,
+            notes,
+            extra_args,
+            restart_on_crash as i64,
+            stop_timeout_secs,
+            chrono::Utc::now().timestamp(),
+            id
+        ],
     )?;
     let updated = get_profile_by_id(&conn, &id)?;
-    drop(conn); // release the DB lock before the tray rebuilds itself
+    drop(conn); // release the DB lock before notifications fan out
 
-    crate::tray::rebuild_tray(&app); // keep the tray menu name in sync
+    crate::sync::after_profile_change(&app, &id);
     Ok(updated)
 }
 
+/// What the UI needs to offer "Undo" right after a delete.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedProfileInfo {
+    pub id: String,
+    pub name: String,
+}
+
 #[tauri::command]
-pub fn delete_profile(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<()> {
+pub fn delete_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<DeletedProfileInfo> {
     let conn = db_lock(&state)?;
-    let profile = get_profile_by_id(&conn, &id)?;
+    let info = delete_profile_inner(&conn, &state.profiles_root, &id)?;
+    drop(conn); // release the DB lock before notifications fan out
+
+    crate::sync::after_profile_change(&app, &id);
+    Ok(info)
+}
+
+/// Business logic of a delete (A3): move the data dir to the trash, snapshot
+/// profile + credentials for undo, purge secrets, remove the row. Unit-tested
+/// via `services::trash`.
+pub(crate) fn delete_profile_inner(
+    conn: &Connection,
+    profiles_root: &std::path::Path,
+    id: &str,
+) -> AppResult<DeletedProfileInfo> {
+    let profile = get_profile_by_id(conn, id)?;
 
     // A running browser must be stopped before its profile can be deleted.
     if profile.status == "running" {
-        return Err(AppError::Validation(
-            "Stop the browser before deleting this profile".into(),
+        return Err(AppError::validation(
+            "Stop the browser before deleting this profile",
         ));
     }
 
-    // Wipe the profile's data directory BEFORE removing the DB row: if the
-    // directory removal fails, the row stays and the user can retry — instead
-    // of an orphaned data folder with no way to delete it from the UI.
-    let dir = std::path::Path::new(&profile.user_data_dir);
-    if dir.starts_with(&state.profiles_root) {
-        if let Err(e) = std::fs::remove_dir_all(dir) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(e.into());
-            }
-        }
-    }
+    // Snapshot credentials BEFORE purge so undo can restore them.
+    let credentials = crate::commands::credentials::list_all_credentials(conn)?
+        .into_iter()
+        .filter(|c| c.profile_id == id)
+        .collect();
 
-    // Purge credentials (DB rows + keychain secrets) together with the data
-    // dir so no secret outlives its profile.
-    crate::commands::credentials::purge_profile_credentials(&conn, &id)?;
+    let info =
+        crate::services::trash::move_profile_to_trash(conn, profiles_root, &profile, credentials)?;
+
+    // Purge credentials (DB rows + legacy keychain secrets) together with the
+    // data dir so no secret outlives its profile. The trash snapshot keeps a
+    // copy for undo — the trash dir itself is 0700 under the private data root.
+    crate::commands::credentials::purge_profile_credentials(conn, id)?;
 
     conn.execute("DELETE FROM profiles WHERE id = ?1", params![id])?;
-    drop(conn); // release the DB lock before the tray rebuilds itself
+    Ok(DeletedProfileInfo { id: info.id, name: info.name })
+}
 
-    crate::tray::rebuild_tray(&app);
-    Ok(())
+#[tauri::command]
+pub fn restore_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<Profile> {
+    let conn = db_lock(&state)?;
+    let profile =
+        crate::services::trash::restore_profile_from_trash(&conn, &state.profiles_root, &id)?;
+    drop(conn);
+    crate::sync::after_profile_change(&app, &profile.id);
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn get_trash_count(state: State<'_, AppState>) -> AppResult<i64> {
+    let conn = db_lock(&state)?;
+    crate::services::trash::trash_count(&conn)
+}
+
+#[tauri::command]
+pub fn empty_trash(app: AppHandle, state: State<'_, AppState>) -> AppResult<usize> {
+    let conn = db_lock(&state)?;
+    let removed = crate::services::trash::empty_trash(&conn)?;
+    drop(conn);
+    if removed > 0 {
+        crate::tray::schedule_rebuild(&app);
+    }
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -296,15 +408,18 @@ pub fn duplicate_profile(
     let profile = Profile {
         id: new_id,
         name,
-        browser_type: source.browser_type,
+        browser_type: source.browser_type.clone(),
         user_data_dir,
-        proxy_id: source.proxy_id,
-        notes: source.notes,
+        proxy_id: source.proxy_id.clone(),
+        notes: source.notes.clone(),
         status: "stopped".to_string(),
         created_at: now,
         updated_at: now,
         last_used_at: None,
         pinned: false,
+        extra_args: source.extra_args.clone(),
+        restart_on_crash: source.restart_on_crash,
+        stop_timeout_secs: source.stop_timeout_secs,
         groups: Vec::new(),
     };
 
@@ -312,13 +427,13 @@ pub fn duplicate_profile(
     // Duplicate carries the account credentials over (secrets re-keyed in the
     // keychain) — a copied farming profile starts with the same accounts.
     crate::commands::credentials::copy_profile_credentials(&conn, &id, &profile.id)?;
-    drop(conn); // release the DB lock before the tray rebuilds itself
-    crate::tray::rebuild_tray(&app);
+    drop(conn); // release the DB lock before notifications fan out
+    crate::sync::after_profile_change(&app, &profile.id);
     Ok(profile)
 }
 
 #[tauri::command]
-pub fn toggle_pin(state: State<'_, AppState>, id: String) -> AppResult<bool> {
+pub fn toggle_pin(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<bool> {
     let conn = db_lock(&state)?;
     let profile = get_profile_by_id(&conn, &id)?;
     let new_pinned = !profile.pinned;
@@ -326,11 +441,14 @@ pub fn toggle_pin(state: State<'_, AppState>, id: String) -> AppResult<bool> {
         "UPDATE profiles SET pinned = ?1, updated_at = ?2 WHERE id = ?3",
         params![new_pinned as i64, chrono::Utc::now().timestamp(), id],
     )?;
+    drop(conn);
+    // Pin order shows in the tray menu too — keep it in sync (A2).
+    crate::sync::after_profile_change(&app, &id);
     Ok(new_pinned)
 }
 
 pub(crate) fn poisoned() -> AppError {
-    AppError::Internal("Database state poisoned".into())
+    AppError::internal("Database state poisoned")
 }
 
 /// Locks the shared DB connection, mapping a poisoned mutex to a clean error.
@@ -350,20 +468,16 @@ mod tests {
     }
 
     fn test_profile(name: &str, pinned: bool) -> Profile {
-        Profile {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: name.to_string(),
-            browser_type: "chromium".to_string(),
-            user_data_dir: format!("/tmp/mbm-test/{name}"),
-            proxy_id: None,
-            notes: None,
-            status: "stopped".to_string(),
-            created_at: 1,
-            updated_at: 1,
-            last_used_at: None,
-            pinned,
-            groups: vec![],
-        }
+        let mut p = Profile::new(
+            uuid::Uuid::new_v4().to_string(),
+            name,
+            "chromium",
+            format!("/tmp/mbm-test/{name}"),
+        );
+        p.created_at = 1;
+        p.updated_at = 1;
+        p.pinned = pinned;
+        p
     }
 
     #[test]
@@ -404,5 +518,60 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(names, vec!["alpha", "Beta", "zeta"]);
+    }
+
+    #[test]
+    fn new_fields_round_trip_through_the_db() {
+        let conn = mem_conn();
+        let mut p = test_profile("Tuned", false);
+        p.extra_args = Some("--disable-gpu".into());
+        p.restart_on_crash = true;
+        p.stop_timeout_secs = Some(10);
+        insert_profile(&conn, &p).unwrap();
+
+        let loaded = get_profile_by_id(&conn, &p.id).unwrap();
+        assert_eq!(loaded.extra_args.as_deref(), Some("--disable-gpu"));
+        assert!(loaded.restart_on_crash);
+        assert_eq!(loaded.stop_timeout_secs, Some(10));
+    }
+
+    #[test]
+    fn delete_moves_data_to_trash_and_deletes_row() {
+        let conn = mem_conn();
+        let root = std::env::temp_dir().join(format!("mbm-del-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("profiles")).unwrap();
+
+        let mut p = Profile::new("del-1", "Doomed", "chromium", "");
+        p.user_data_dir = root.join("profiles").join("del-1").to_string_lossy().to_string();
+        p.created_at = 1;
+        p.updated_at = 1;
+        insert_profile(&conn, &p).unwrap();
+        std::fs::create_dir_all(&p.user_data_dir).unwrap();
+
+        let info = delete_profile_inner(&conn, &root.join("profiles"), "del-1").unwrap();
+        assert_eq!(info.name, "Doomed");
+        assert!(!std::path::Path::new(&p.user_data_dir).exists());
+        assert!(crate::services::trash::trash_count(&conn).unwrap() >= 1);
+
+        // Restore again so trash doesn't leak between tests.
+        crate::services::trash::empty_trash(&conn).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_launch_fields_rejects_unknown_browser() {
+        assert!(validate_launch_fields("chrome", None).is_ok());
+        assert!(validate_launch_fields("nobody-browser", None).is_err());
+        assert!(validate_launch_fields("chromium", Some("--user-data-dir=/tmp")).is_err());
+    }
+
+    #[test]
+    fn stop_timeout_bounds_are_enforced() {
+        assert!(validate_stop_timeout(None).is_ok());
+        assert!(validate_stop_timeout(Some(1)).is_ok());
+        assert!(validate_stop_timeout(Some(60)).is_ok());
+        assert!(validate_stop_timeout(Some(0)).is_err());
+        assert!(validate_stop_timeout(Some(61)).is_err());
     }
 }

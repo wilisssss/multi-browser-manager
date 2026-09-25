@@ -15,6 +15,10 @@ interface Props {
   onTogglePin: (id: string) => Promise<unknown>;
   onCredentials: (profile: Profile) => void;
   onError: (message: string) => void;
+  /** Live RAM/CPU of this profile's browser tree (null when not sampled). */
+  usage?: { memoryKb: number; cpuPercent: number | null } | null;
+  /** Total time this profile's browsers have been used, in seconds. */
+  totalSeconds?: number | null;
 }
 
 const BROWSER_ICONS: Record<string, typeof Globe> = {
@@ -35,8 +39,13 @@ export const ProfileCard = memo(function ProfileCard({
   onTogglePin,
   onCredentials,
   onError,
+  usage,
+  totalSeconds,
 }: Props) {
   const [busy, setBusy] = useState(false);
+  // L12: pin has its own busy flag — double-clicks queue one toggle instead
+  // of firing two parallel refreshes.
+  const [pinBusy, setPinBusy] = useState(false);
   const running = profile.status === "running";
 
   const Icon = BROWSER_ICONS[profile.browserType] ?? Globe;
@@ -55,6 +64,16 @@ export const ProfileCard = memo(function ProfileCard({
       onError(String(e));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleTogglePin = async () => {
+    if (pinBusy) return;
+    setPinBusy(true);
+    try {
+      await onTogglePin(profile.id);
+    } finally {
+      setPinBusy(false);
     }
   };
 
@@ -122,6 +141,31 @@ export const ProfileCard = memo(function ProfileCard({
         </div>
       )}
 
+      {/* Live RAM/CPU (feature 2) + auto-restart marker (feature 4) */}
+      {(running || profile.restartOnCrash) && (
+        <div className="mb-3 flex flex-wrap items-center gap-1.5 text-xs">
+          {usage && (
+            <span
+              className="inline-flex items-center gap-1 rounded-md bg-neutral-100 px-2 py-0.5 font-mono text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300"
+              title="Resident memory of the whole browser process tree"
+            >
+              🧠 {usage.memoryKb >= 1024 ? `${(usage.memoryKb / 1024).toFixed(0)} MiB` : `${usage.memoryKb} KiB`}
+              <span className="text-neutral-400">
+                {usage.cpuPercent == null ? "" : `· ${usage.cpuPercent.toFixed(0)}%`}
+              </span>
+            </span>
+          )}
+          {profile.restartOnCrash && (
+            <span
+              className="inline-flex items-center gap-1 rounded-md bg-amber-100/70 px-2 py-0.5 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+              title="Auto-restarts after an unexpected exit (up to 3 times)"
+            >
+              ↻ auto-restart
+            </span>
+          )}
+        </div>
+      )}
+
       {profile.notes && (
         <p className="mb-3 line-clamp-2 text-xs leading-relaxed text-neutral-500" title={profile.notes}>
           {profile.notes}
@@ -130,6 +174,16 @@ export const ProfileCard = memo(function ProfileCard({
 
       <p className="mb-4 text-xs text-neutral-400 dark:text-neutral-500">
         Last used: {formatLastUsed(profile.lastUsedAt)}
+        {totalSeconds != null && totalSeconds >= 60 && (
+          <span
+            className="ml-2 rounded bg-neutral-100 px-1.5 py-0.5 font-mono text-[10px] text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+            title="Total browser time recorded for this profile"
+          >
+            {totalSeconds >= 3600
+              ? `${(totalSeconds / 3600).toFixed(1)} h used`
+              : `${Math.round(totalSeconds / 60)} min used`}
+          </span>
+        )}
       </p>
 
       {/* Actions — flex-wrap so the row can never overflow the card box. */}
@@ -162,15 +216,22 @@ export const ProfileCard = memo(function ProfileCard({
         </button>
 
         <button
-          onClick={() => onTogglePin(profile.id)}
+          onClick={handleTogglePin}
+          disabled={pinBusy}
           title={profile.pinned ? "Unpin" : "Pin to top"}
-          className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 ${
+          className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg hover:bg-neutral-100 disabled:opacity-50 dark:hover:bg-neutral-800 ${
             profile.pinned
               ? "text-amber-500"
               : "text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
           }`}
         >
-          {profile.pinned ? <Pin className="h-4 w-4" /> : <PinOff className="h-4 w-4" />}
+          {pinBusy ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : profile.pinned ? (
+            <Pin className="h-4 w-4" />
+          ) : (
+            <PinOff className="h-4 w-4" />
+          )}
         </button>
         <button
           onClick={() => onEdit(profile)}
@@ -189,7 +250,7 @@ export const ProfileCard = memo(function ProfileCard({
         <button
           onClick={async () => {
             const ok = await ask(
-              `Delete profile "${profile.name}"?\n\nIts isolated data folder (cookies, sessions, cache) will be permanently wiped from disk.`,
+              `Delete profile "${profile.name}"?\n\nIts data folder is moved to the trash — you can undo from the banner within 30 seconds (kept 30 days in total).`,
               { title: "Delete profile", kind: "warning", okLabel: "Delete", cancelLabel: "Cancel" },
             );
             if (ok) await onDelete(profile.id);

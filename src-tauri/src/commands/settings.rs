@@ -66,24 +66,24 @@ pub fn save_settings(conn: &rusqlite::Connection, settings: &Settings) -> AppRes
 
 fn validate(settings: &Settings) -> AppResult<()> {
     if !(1..=3650).contains(&settings.history_retention_days) {
-        return Err(AppError::Validation(
-            "History retention must be between 1 and 3650 days".into(),
+        return Err(AppError::validation(
+            "History retention must be between 1 and 3650 days",
         ));
     }
     if !(10..=100_000).contains(&settings.history_max_entries) {
-        return Err(AppError::Validation(
-            "History max entries must be between 10 and 100000".into(),
+        return Err(AppError::validation(
+            "History max entries must be between 10 and 100000",
         ));
     }
     if !(1..=100).contains(&settings.auto_backup_keep) {
-        return Err(AppError::Validation(
-            "Snapshots to keep must be between 1 and 100".into(),
+        return Err(AppError::validation(
+            "Snapshots to keep must be between 1 and 100",
         ));
     }
     for ws in settings.group_workspaces.values() {
         if !(1..=100).contains(ws) {
-            return Err(AppError::Validation(
-                "Workspace numbers must be between 1 and 100".into(),
+            return Err(AppError::validation(
+                "Workspace numbers must be between 1 and 100",
             ));
         }
     }
@@ -102,6 +102,40 @@ pub fn update_settings(state: State<'_, AppState>, settings: Settings) -> AppRes
     let conn = db_lock(&state)?;
     save_settings(&conn, &settings)?;
     Ok(settings)
+}
+
+// ---- Window rules / workspaces (moved from commands/window_rules.rs — A6:
+// one "display preferences" domain, one module) ----
+
+use crate::browser::launcher;
+
+/// Per-profile window identity: every browser is launched with a unique
+/// `--class` / `--wayland-app-id` so compositors (niri, etc.) can attach
+/// window rules per profile, and workspaces can be assigned per tag.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowRule {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub app_id: String,
+    pub status: String,
+    pub group_ids: Vec<String>,
+}
+
+#[tauri::command]
+pub fn get_window_rules(state: State<'_, AppState>) -> AppResult<Vec<WindowRule>> {
+    let conn = db_lock(&state)?;
+    let profiles = crate::commands::profile::list_profiles(&conn)?;
+    Ok(profiles
+        .into_iter()
+        .map(|p| WindowRule {
+            app_id: launcher::window_app_id(&p.id, &p.name),
+            profile_id: p.id,
+            profile_name: p.name,
+            status: p.status,
+            group_ids: p.groups.iter().map(|g| g.id.clone()).collect(),
+        })
+        .collect())
 }
 
 #[cfg(test)]

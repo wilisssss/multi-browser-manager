@@ -22,6 +22,11 @@ export function ProfileForm({ profile, proxies, groups, defaultBrowserType, onCr
   const [browserType, setBrowserType] = useState(profile?.browserType ?? defaultBrowserType ?? "");
   const [proxyId, setProxyId] = useState<string>(profile?.proxyId ?? "");
   const [notes, setNotes] = useState(profile?.notes ?? "");
+  const [extraArgs, setExtraArgs] = useState(profile?.extraArgs ?? "");
+  const [restartOnCrash, setRestartOnCrash] = useState(profile?.restartOnCrash ?? false);
+  const [stopTimeoutSecs, setStopTimeoutSecs] = useState<number | "">(
+    profile?.stopTimeoutSecs ?? "",
+  );
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(
     () => new Set(profile?.groups.map((g) => g.id) ?? []),
   );
@@ -81,6 +86,10 @@ export function ProfileForm({ profile, proxies, groups, defaultBrowserType, onCr
           browserType,
           proxyId: proxyId || null,
           notes: notes.trim() || null,
+          extraArgs: extraArgs.trim() || null,
+          restartOnCrash,
+          stopTimeoutSecs:
+            stopTimeoutSecs === "" ? null : Math.min(60, Math.max(1, Number(stopTimeoutSecs))),
         },
         Array.from(selectedGroups),
       );
@@ -119,6 +128,13 @@ export function ProfileForm({ profile, proxies, groups, defaultBrowserType, onCr
               autoFocus
               className="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
             />
+            {profile && name.trim() && name.trim().toLowerCase() !== profile.name.toLowerCase() && (
+              <p className="mt-1.5 rounded-md border border-amber-300/60 bg-amber-50 px-2.5 py-1.5 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+                CLI/WM keybinds that use <code className="font-mono">mbm --launch {profile.name}</code>{" "}
+                stop working after this rename — update them to{" "}
+                <code className="font-mono">mbm --launch {name.trim()}</code>.
+              </p>
+            )}
           </div>
 
           <div>
@@ -210,6 +226,49 @@ export function ProfileForm({ profile, proxies, groups, defaultBrowserType, onCr
               >
                 {addingTag ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
               </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">
+              Extra launch arguments (optional)
+            </label>
+            <input
+              value={extraArgs}
+              onChange={(e) => setExtraArgs(e.target.value)}
+              placeholder="--disable-gpu --start-maximized https://example.com"
+              className="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
+            />
+            <p className="mt-1 text-xs text-neutral-400 dark:text-neutral-500">
+              Appended to the browser command line. Flags managed by MBM
+              (--user-data-dir, --proxy-server, --load-extension, --class) are
+              rejected.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-2 items-end gap-3">
+            <label className="flex items-center gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
+              <input
+                type="checkbox"
+                checked={restartOnCrash}
+                onChange={(e) => setRestartOnCrash(e.target.checked)}
+                className="h-4 w-4 accent-blue-600"
+              />
+              Auto-restart on crash
+            </label>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">
+                Stop timeout (s)
+              </label>
+              <input
+                type="number"
+                min={1}
+                max={60}
+                value={stopTimeoutSecs}
+                onChange={(e) => setStopTimeoutSecs(e.target.value === "" ? "" : Number(e.target.value))}
+                placeholder="3"
+                className="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
+              />
             </div>
           </div>
 

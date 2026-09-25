@@ -4,6 +4,9 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod proxy_manager;
+pub mod services;
+pub mod startup;
+pub mod sync;
 pub mod tray;
 
 use std::collections::HashMap;
@@ -12,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::browser::launcher;
+use commands::process::RunningProc;
 
 /// CLI actions usable from WM keybinds (e.g. niri):
 ///   mbm --launch <profile-name-or-id>   launch a profile's browser
@@ -149,20 +152,7 @@ mod cli {
             let conn = crate::db::init(std::path::Path::new(":memory:")).unwrap();
             crate::commands::profile::insert_profile(
                 &conn,
-                &crate::models::profile::Profile {
-                    id: "fixed-id".into(),
-                    name: "Work".into(),
-                    browser_type: "chromium".into(),
-                    user_data_dir: "/tmp/mbm/fixed-id".into(),
-                    proxy_id: None,
-                    notes: None,
-                    status: "stopped".into(),
-                    created_at: 1,
-                    updated_at: 1,
-                    last_used_at: None,
-                    pinned: false,
-                    groups: vec![],
-                },
+                &crate::models::profile::Profile::new("fixed-id", "Work", "chromium", "/tmp/mbm/fixed-id"),
             )
             .unwrap();
 
@@ -183,14 +173,20 @@ pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     /// Root directory that holds one sub-directory per profile.
     pub profiles_root: PathBuf,
-    /// Pids of currently running browser processes, keyed by profile id.
-    /// The tokio Child itself is owned by the per-profile watcher task.
-    pub running: Arc<AsyncMutex<HashMap<String, u32>>>,
-    /// browser_type -> executable path cache, filled on demand.
+    /// Process registry (A1): one entry per running browser. The tokio Child
+    /// is owned by the per-profile supervisor task; the entry exposes a stop
+    /// channel into it and an exit signal out of it — no pid polling.
+    pub running: Arc<AsyncMutex<HashMap<String, RunningProc>>>,
+    /// browser_type -> executable path cache, filled on demand. Cleared on
+    /// every explicit `detect_browsers` IPC call so installs/uninstalls made
+    /// while MBM runs are picked up without a restart (L5).
     pub browser_cache: Arc<Mutex<HashMap<String, String>>>,
     /// Per-profile operation locks: serialize launch/stop of the same profile
     /// so concurrent triggers (tray + CLI keybind) can't double-spawn.
     pub profile_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// CPU-usage baselines for the resource panel (F2): pid →
+    /// (total cpu ticks at last sample, when it was taken).
+    pub usage_samples: Arc<Mutex<HashMap<u32, (u64, std::time::Instant)>>>,
 }
 
 fn app_data_root() -> PathBuf {
@@ -205,8 +201,15 @@ fn app_data_root() -> PathBuf {
 /// Designed for WM keybinds / scripts (e.g. rofi, fuzzel menus in niri).
 fn handle_list_command() {
     let db_path = app_data_root().join("mbm.sqlite3");
-    let conn = match db::init(&db_path) {
-        Ok(c) => c,
+    // Read-only: this process must never run migrations (that races with the
+    // app's startup migration pass) nor touch the file at all. A DB that does
+    // not exist yet simply means "no profiles".
+    let conn = match db::open_readonly(&db_path) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            println!("[]");
+            std::process::exit(0);
+        }
         Err(e) => {
             eprintln!("mbm: failed to open database: {e}");
             std::process::exit(1);
@@ -300,70 +303,30 @@ pub fn run() {
             // out of the OS keychain into the database.
             commands::credentials::migrate_keychain_secrets_to_db(&conn);
 
-            // Reconcile DB status with reality: a browser may have outlived the
-            // previous MBM session (orphan with a live SingletonLock). If its pid
-            // is alive AND its cmdline references this profile's data dir, keep it
-            // as 'running' (stop_profile can still kill it via the lock); any
-            // stale 'running' row without a live browser converges to 'stopped'.
-            {
-                let mut stmt = conn.prepare("SELECT id, user_data_dir, status FROM profiles")?;
-                let rows = stmt
-                    .query_map([], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                for (id, dir, status) in rows {
-                    let alive = launcher::singleton_pid(std::path::Path::new(&dir))
-                        .filter(|pid| {
-                            launcher::pid_alive(*pid)
-                                && launcher::pid_cmdline_contains(*pid, &dir)
-                        })
-                        .is_some();
-
-                    let desired = if alive { "running" } else { "stopped" };
-                    if status != desired {
-                        let _ = conn.execute(
-                            "UPDATE profiles SET status = ?1 WHERE id = ?2",
-                            rusqlite::params![desired, id],
-                        );
-                        // Clean the lock of a dead browser so the next launch works.
-                        if !alive {
-                            let _ = std::fs::remove_file(
-                                std::path::Path::new(&dir).join("SingletonLock"),
-                            );
-                        }
-                    }
-                }
+            // Reconcile DB status with reality (orphans from a previous session
+            // back to 'running', stale rows to 'stopped'). See startup.rs for
+            // the full rules and per-platform limitations.
+            if let Err(e) = startup::reconcile_statuses(&conn) {
+                eprintln!("mbm: status reconciliation failed: {e}");
             }
 
-            // Prune launch history per user settings: drop closed entries older
-            // than the retention window and cap the table size.
-            {
-                let settings = commands::settings::load_settings(&conn);
-                let retention = settings.history_retention_days.clamp(1, 3650);
-                let max_entries = settings.history_max_entries.clamp(10, 100_000);
-                let cutoff = chrono::Utc::now().timestamp() - retention * 24 * 3600;
-                if let Err(e) = conn.execute(
-                    "DELETE FROM launch_history WHERE closed_at IS NOT NULL AND closed_at < ?1",
-                    rusqlite::params![cutoff],
-                ) {
-                    eprintln!("mbm: failed to prune launch history by age: {e}");
-                }
-                if let Err(e) = conn.execute(
-                    &format!(
-                        "DELETE FROM launch_history WHERE id NOT IN (
-                            SELECT id FROM launch_history ORDER BY launched_at DESC LIMIT {max_entries}
-                        )"
-                    ),
-                    [],
-                ) {
-                    eprintln!("mbm: failed to cap launch history size: {e}");
-                }
+            // Sweep leftover proxy-extension credential dirs from previous
+            // sessions (e.g. MBM crashed while browsers were still open).
+            // Runs AFTER reconciliation: orphaned-but-live profiles are now
+            // 'running' with a verified SingletonLock, so the sweep keeps
+            // their extension files (live browsers still reference them) and
+            // deletes the rest.
+            proxy_manager::cleanup_all_extensions(&[], &conn);
+
+            // Prune launch history per user settings.
+            startup::prune_launch_history(&conn, &commands::settings::load_settings(&conn));
+
+            // Purge trash snapshots older than the retention window (F6) so
+            // deleted profile data does not linger forever.
+            match startup::purge_expired_trash(&conn, &profiles_root) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("mbm: purged {n} expired trash snapshot(s)"),
+                Err(e) => eprintln!("mbm: trash purge failed: {e}"),
             }
 
             app.manage(AppState {
@@ -372,6 +335,7 @@ pub fn run() {
                 running: Arc::new(AsyncMutex::new(HashMap::new())),
                 browser_cache: Arc::new(Mutex::new(HashMap::new())),
                 profile_locks: Arc::new(Mutex::new(HashMap::new())),
+                usage_samples: Arc::new(Mutex::new(HashMap::new())),
             });
 
             // Belt and braces: strip client-side decorations at runtime too
@@ -379,10 +343,6 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 if let Err(e) = window.set_decorations(false) {
                     eprintln!("mbm: failed to unset decorations: {e}");
-                }
-                match window.is_decorated() {
-                    Ok(decorated) => eprintln!("mbm: window decorated = {decorated}"),
-                    Err(e) => eprintln!("mbm: is_decorated failed: {e}"),
                 }
             }
 
@@ -393,8 +353,9 @@ pub fn run() {
             }
 
             // System tray: dashboard access + per-profile launch/stop toggles.
-            // rebuild_tray guards itself against libappindicator load failures.
-            tray::rebuild_tray(app.handle());
+            // schedule_rebuild lazily spawns the single debounce worker (L8);
+            // its first pass performs the initial build.
+            tray::schedule_rebuild(app.handle());
 
             // Automatic snapshot backups: check shortly after startup, then
             // every 6 hours (run_snapshot_if_due enforces a 24 h interval and
@@ -403,7 +364,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    commands::backup::run_snapshot_if_due(&snapshot_app.state::<AppState>());
+                    crate::services::backup::run_snapshot_if_due(&snapshot_app.state::<AppState>());
                     tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
                 }
             });
@@ -424,6 +385,9 @@ pub fn run() {
             commands::profile::create_profile,
             commands::profile::update_profile,
             commands::profile::delete_profile,
+            commands::profile::restore_profile,
+            commands::profile::get_trash_count,
+            commands::profile::empty_trash,
             commands::profile::duplicate_profile,
             commands::profile::toggle_pin,
             // Groups / tags
@@ -435,7 +399,8 @@ pub fn run() {
             commands::process::stop_profile,
             commands::process::bulk_launch,
             commands::process::bulk_stop,
-            commands::process::get_running_profiles,
+            commands::process::get_resource_usage,
+            commands::process::get_usage_stats,
             commands::process::get_launch_history,
             // Browser
             commands::detect_browsers,
@@ -447,13 +412,13 @@ pub fn run() {
             commands::proxy::test_proxy,
             // Backup
             commands::backup::export_profiles,
+            commands::backup::export_profiles_encrypted,
             commands::backup::import_profiles,
             commands::backup::get_backup_dir,
-            // Settings
+            // Settings + window rules / workspaces
             commands::settings::get_settings,
             commands::settings::update_settings,
-            // Window rules / workspaces
-            commands::window_rules::get_window_rules,
+            commands::settings::get_window_rules,
             // Credentials (per-profile accounts; secrets in the local DB)
             commands::credentials::get_credentials,
             commands::credentials::create_credential,
@@ -462,11 +427,24 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Multi Browser Manager")
-        .run(|_app_handle, event| {
+        .run(|app_handle, event| {
             // On any exit path (tray quit, SIGTERM, updater restart): remove
             // leftover proxy extension dirs — they contain credentials.
+            // Profiles whose browser is still running in THIS session are
+            // skipped: Chromium loads the extension lazily (service-worker
+            // reload), so deleting it under a live browser breaks its proxy
+            // auth mid-session. The watcher cleans those when they exit; the
+            // next MBM startup sweeps anything still behind.
             if let tauri::RunEvent::Exit = event {
-                proxy_manager::cleanup_all_extensions();
+                let app = app_handle.clone();
+                tauri::async_runtime::block_on(async move {
+                    let state = app.state::<AppState>();
+                    let running: Vec<String> = state.running.lock().await.keys().cloned().collect();
+                    let db = state.db.clone();
+                    drop(state);
+                    let Ok(conn) = db.lock() else { return };
+                    proxy_manager::cleanup_all_extensions(&running, &conn);
+                });
             }
         });
 }

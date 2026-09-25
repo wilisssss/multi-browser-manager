@@ -38,7 +38,7 @@ pub fn create_group(state: State<'_, AppState>, name: String) -> AppResult<Group
     let conn = db_lock(&state)?;
     let name = name.trim().to_string();
     if name.is_empty() {
-        return Err(AppError::Validation("Tag name cannot be empty".into()));
+        return Err(AppError::validation("Tag name cannot be empty"));
     }
 
     let exists: bool = conn.query_row(
@@ -47,7 +47,7 @@ pub fn create_group(state: State<'_, AppState>, name: String) -> AppResult<Group
         |r| r.get(0),
     )?;
     if exists {
-        return Err(AppError::Validation(format!("Tag '{name}' already exists")));
+        return Err(AppError::validation(format!("Tag '{name}' already exists")));
     }
 
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))?;
@@ -82,7 +82,7 @@ pub fn set_profile_groups(
         |r| r.get(0),
     )?;
     if !profile_exists {
-        return Err(AppError::NotFound(format!("Profile {profile_id} not found")));
+        return Err(AppError::not_found(format!("Profile {profile_id} not found")));
     }
 
     // Validate all group ids first so we never leave a partial assignment.
@@ -93,7 +93,7 @@ pub fn set_profile_groups(
             |r| r.get(0),
         )?;
         if !exists {
-            return Err(AppError::Validation(format!("Tag {gid} not found")));
+            return Err(AppError::validation(format!("Tag {gid} not found")));
         }
     }
 
