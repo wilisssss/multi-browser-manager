@@ -9,7 +9,7 @@ Dibangun dengan **Tauri v2 (Rust)** + **React + Vite + TailwindCSS**.
 - **CRUD profile** dengan isolasi data penuh (per-profile `user-data-dir`, permission `700` di Linux)
 - **Launch / stop browser** per profile, dengan deteksi otomatis saat browser ditutup manual (event `profile-stopped`)
 - **Bulk launch / stop** — tombol "Launch all" / "Stop all" di toolbar
-- **System tray** — tutup window hanya menyembunyikan dashboard (browser tetap di-watch); menu tray: Show Dashboard, toggle launch/stop per profile (● running / ○ stopped), **Stop all browsers**, Quit. Ikon tray muncul di status bar apa pun yang mendukung SNI (QuickShell, Waybar, dst.). Butuh `libayatana-appindicator` di Linux; tanpa itu app tetap jalan (tray dilewati). Rebuild menu di-debounce lewat satu worker thread.
+- **System tray** — menu tray: Show Dashboard, toggle launch/stop per profile (● running / ○ stopped), **Stop all browsers**, Quit. Menutup window (via compositor, mis. niri) keluar dari app; browser yang masih jalan dibiarkan hidup dan statusnya direkonsiliasi saat MBM dibuka lagi. Ikon tray muncul di status bar apa pun yang mendukung SNI (QuickShell, Waybar, dst.). Butuh `libayatana-appindicator` di Linux; tanpa itu app tetap jalan (tray dilewati). Rebuild menu di-debounce lewat satu worker thread.
 - **Tags / groups** — beri label berwarna pada profile, filter by tag di toolbar
 - **Pin profile** — profile yang di-pin selalu di atas (urutan: pinned → nama)
 - **Deteksi browser** terinstall (Linux / Windows / macOS), termasuk versi
