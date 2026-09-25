@@ -34,6 +34,7 @@ import { WindowRulesModal } from "./WindowRulesModal";
 import { CredentialsModal } from "./CredentialsModal";
 import { Select } from "./Select";
 import { exportProfiles, importProfiles, bulkLaunch, bulkStop, setProfileGroups, togglePin, getSettings, updateSettings } from "../lib/tauri-api";
+import { getVersion } from "@tauri-apps/api/app";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import type { Profile } from "../types";
 import type { Theme } from "../hooks/useTheme";
@@ -41,6 +42,32 @@ import type { Theme } from "../hooks/useTheme";
 interface Props {
   theme: Theme;
   toggleTheme: () => void;
+}
+
+/** Sort orders for the profile grid. Pinned profiles always stay on top. */
+type SortKey =
+  | "name-asc"
+  | "name-desc"
+  | "last-used-desc"
+  | "last-used-asc"
+  | "created-desc"
+  | "created-asc"
+  | "status";
+
+const SORT_STORAGE_KEY = "mbm.sort";
+
+function loadSort(): SortKey {
+  const stored = localStorage.getItem(SORT_STORAGE_KEY);
+  const valid: SortKey[] = [
+    "name-asc",
+    "name-desc",
+    "last-used-desc",
+    "last-used-asc",
+    "created-desc",
+    "created-asc",
+    "status",
+  ];
+  return valid.includes(stored as SortKey) ? (stored as SortKey) : "name-asc";
 }
 
 export function Dashboard({ theme, toggleTheme }: Props) {
@@ -56,6 +83,20 @@ export function Dashboard({ theme, toggleTheme }: Props) {
   const [statusFilter, setStatusFilter] = useState<"all" | "running" | "stopped">("all");
   const [browserFilter, setBrowserFilter] = useState<string>("all");
   const [tagFilter, setTagFilter] = useState<string>("all");
+  const [sortBy, setSortBy] = useState<SortKey>(loadSort);
+  const [appVersion, setAppVersion] = useState<string>("");
+
+  // Remember the chosen sort across sessions.
+  useEffect(() => {
+    localStorage.setItem(SORT_STORAGE_KEY, sortBy);
+  }, [sortBy]);
+
+  // Displayed next to the app title.
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => {});
+  }, []);
 
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Profile | null>(null);
@@ -121,7 +162,7 @@ export function Dashboard({ theme, toggleTheme }: Props) {
 
   const filtered = useMemo(() => {
     const q = debouncedSearch.trim().toLowerCase();
-    return profilesState.profiles.filter((p) => {
+    const matched = profilesState.profiles.filter((p) => {
       if (q && !p.name.toLowerCase().includes(q) && !(p.notes ?? "").toLowerCase().includes(q)) {
         return false;
       }
@@ -130,7 +171,39 @@ export function Dashboard({ theme, toggleTheme }: Props) {
       if (tagFilter !== "all" && !p.groups.some((g) => g.id === tagFilter)) return false;
       return true;
     });
-  }, [profilesState.profiles, debouncedSearch, statusFilter, browserFilter, tagFilter]);
+
+    // Pinned profiles always float to the top, whatever the sort order.
+    const byName = (a: Profile, b: Profile) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    const byTime = (key: "lastUsedAt" | "createdAt", desc: boolean) => (a: Profile, b: Profile) => {
+      const av = a[key];
+      const bv = b[key];
+      // Never-used profiles sink to the bottom regardless of direction.
+      if (av == null && bv == null) return byName(a, b);
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      return desc ? bv - av : av - bv;
+    };
+
+    const comparators: Record<SortKey, (a: Profile, b: Profile) => number> = {
+      "name-asc": byName,
+      "name-desc": (a, b) => byName(b, a),
+      "last-used-desc": byTime("lastUsedAt", true),
+      "last-used-asc": byTime("lastUsedAt", false),
+      "created-desc": byTime("createdAt", true),
+      "created-asc": byTime("createdAt", false),
+      status: (a, b) => {
+        // Running first, then alphabetical.
+        if (a.status !== b.status) return a.status === "running" ? -1 : 1;
+        return byName(a, b);
+      },
+    };
+    const cmp = comparators[sortBy];
+    return matched.sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return cmp(a, b);
+    });
+  }, [profilesState.profiles, debouncedSearch, statusFilter, browserFilter, tagFilter, sortBy]);
 
   const runningCount = profilesState.profiles.filter((p) => p.status === "running").length;
 
@@ -373,6 +446,13 @@ export function Dashboard({ theme, toggleTheme }: Props) {
       action: profilesState.refresh,
     },
     {
+      id: "check-updates",
+      label: "Check for updates",
+      section: "Actions",
+      icon: Download,
+      action: updater.checkForUpdates,
+    },
+    {
       id: "export",
       label: "Export backup…",
       section: "Actions",
@@ -436,7 +516,14 @@ export function Dashboard({ theme, toggleTheme }: Props) {
             <Globe className="h-5 w-5 text-white" />
           </div>
           <div>
-            <h1 className="text-lg font-semibold">Multi Browser Manager</h1>
+            <h1 className="text-lg font-semibold">
+              Multi Browser Manager
+              {appVersion && (
+                <span className="ml-2 rounded-md bg-neutral-200/80 px-1.5 py-0.5 align-middle text-[11px] font-medium text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300">
+                  v{appVersion}
+                </span>
+              )}
+            </h1>
             <p className="text-xs text-neutral-500">
               {profilesState.profiles.length} profiles · {runningCount} running
             </p>
@@ -485,14 +572,15 @@ export function Dashboard({ theme, toggleTheme }: Props) {
           <button
             onClick={updater.checkForUpdates}
             disabled={updater.status.state === "checking" || updater.status.state === "downloading"}
-            title="Check for updates"
-            className="rounded-lg px-3 py-2 text-sm text-neutral-600 hover:bg-neutral-200/70 disabled:opacity-50 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            title={`Check for updates${appVersion ? ` (current: v${appVersion})` : ""}`}
+            className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-neutral-600 hover:bg-neutral-200/70 disabled:opacity-50 dark:text-neutral-300 dark:hover:bg-neutral-800"
           >
             {updater.status.state === "checking" || updater.status.state === "downloading" ? (
               <RefreshCw className="h-4 w-4 animate-spin" />
             ) : (
               <Download className="h-4 w-4" />
             )}
+            Check update
           </button>
           <button
             onClick={toggleTheme}
@@ -610,6 +698,21 @@ export function Dashboard({ theme, toggleTheme }: Props) {
           options={[
             { value: "all", label: "All tags" },
             ...groupsState.groups.map((g) => ({ value: g.id, label: g.name })),
+          ]}
+        />
+
+        <Select
+          className="w-56"
+          value={sortBy}
+          onChange={(v) => setSortBy(v as SortKey)}
+          options={[
+            { value: "name-asc", label: "Sort: Name A–Z" },
+            { value: "name-desc", label: "Sort: Name Z–A" },
+            { value: "last-used-desc", label: "Sort: Last used (newest)" },
+            { value: "last-used-asc", label: "Sort: Last used (oldest)" },
+            { value: "created-desc", label: "Sort: Created (newest)" },
+            { value: "created-asc", label: "Sort: Created (oldest)" },
+            { value: "status", label: "Sort: Status" },
           ]}
         />
 
