@@ -86,7 +86,7 @@ export function ResourcesModal({ names, onClose }: Props) {
                   {names[u.profileId] ?? u.profileId}
                 </span>
                 <span className="ml-3 flex shrink-0 items-center gap-3 font-mono text-xs text-neutral-500 dark:text-neutral-400">
-                  <span title="Resident memory (whole process tree)">🧠 {formatMemory(u.memoryKb)}</span>
+                  <span title="Proportional memory of the whole process tree (shared pages counted once)">🧠 {formatMemory(u.memoryKb)}</span>
                   <span className="w-14 text-right" title="CPU since the previous sample">
                     {u.cpuPercent == null ? "—" : `${u.cpuPercent.toFixed(1)}%`}
                   </span>
