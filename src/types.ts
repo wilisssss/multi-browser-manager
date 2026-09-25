@@ -22,6 +22,8 @@ export interface Profile {
   restartOnCrash: boolean;
   /** Graceful-stop window in seconds; null = 3 s default. */
   stopTimeoutSecs: number | null;
+  /** Folder this profile lives in; null = unfiled (root's pseudo-view). */
+  folderId: string | null;
   groups: Group[];
 }
 
@@ -33,6 +35,7 @@ export interface CreateProfileInput {
   extraArgs?: string | null;
   restartOnCrash?: boolean;
   stopTimeoutSecs?: number | null;
+  folderId?: string | null;
 }
 
 export interface UpdateProfileInput {
@@ -43,6 +46,18 @@ export interface UpdateProfileInput {
   extraArgs?: string | null;
   restartOnCrash?: boolean;
   stopTimeoutSecs?: number | null;
+  folderId?: string | null;
+}
+
+/** A user-created folder grouping profiles (file-manager style, nestable). */
+export interface Folder {
+  id: string;
+  name: string;
+  parentId: string | null;
+  position: number;
+  createdAt: number;
+  /** Number of profiles directly inside (filled by the backend). */
+  profileCount: number;
 }
 
 /** Per-profile RAM/CPU usage of the running browser tree (Linux only). */

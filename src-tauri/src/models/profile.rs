@@ -29,6 +29,10 @@ pub struct Profile {
     /// `None` = the 3-second default.
     #[serde(default)]
     pub stop_timeout_secs: Option<i64>,
+    /// Folder this profile lives in (`None` = unfiled, shown in the root's
+    /// "unfiled" view).
+    #[serde(default)]
+    pub folder_id: Option<String>,
     #[serde(default)]
     pub groups: Vec<Group>,
 }
@@ -54,6 +58,7 @@ impl Profile {
             extra_args: None,
             restart_on_crash: false,
             stop_timeout_secs: None,
+            folder_id: None,
             groups: Vec::new(),
         }
     }
@@ -75,6 +80,9 @@ pub struct CreateProfileInput {
     /// 1..=60, None = default.
     #[serde(default)]
     pub stop_timeout_secs: Option<i64>,
+    /// Folder to file the new profile into.
+    #[serde(default)]
+    pub folder_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,4 +98,6 @@ pub struct UpdateProfileInput {
     pub extra_args: Option<Option<String>>,
     pub restart_on_crash: Option<bool>,
     pub stop_timeout_secs: Option<Option<i64>>,
+    /// Same double-Option semantics: absent = keep, null = unfile, value = move.
+    pub folder_id: Option<Option<String>>,
 }

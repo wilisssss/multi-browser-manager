@@ -21,6 +21,8 @@ interface Props {
   onCredentials: (profile: Profile) => void;
   onError: (message: string) => void;
   onCreate: () => void;
+  /** Opens the folder picker for this profile. */
+  onMove: (profile: Profile) => void;
 }
 
 export const ProfileList = memo(function ProfileList({
@@ -38,6 +40,7 @@ export const ProfileList = memo(function ProfileList({
   onCredentials,
   onError,
   onCreate,
+  onMove,
 }: Props) {
   if (loading) {
     return (
@@ -79,6 +82,7 @@ export const ProfileList = memo(function ProfileList({
           onTogglePin={onTogglePin}
           onCredentials={onCredentials}
           onError={onError}
+          onMove={onMove}
         />
       ))}
     </div>

@@ -1,4 +1,4 @@
-import { Chrome, Compass, Globe, Loader2, Play, Pencil, Copy, Trash2, Square, Pin, PinOff, KeyRound } from "lucide-react";
+import { Chrome, Compass, Globe, Loader2, Play, Pencil, Copy, Trash2, Square, Pin, PinOff, KeyRound, Move } from "lucide-react";
 import { memo, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { formatLastUsed } from "../lib/format";
@@ -15,6 +15,8 @@ interface Props {
   onTogglePin: (id: string) => Promise<unknown>;
   onCredentials: (profile: Profile) => void;
   onError: (message: string) => void;
+  /** Opens the folder picker (move to another folder). */
+  onMove: (profile: Profile) => void;
   /** Live RAM/CPU of this profile's browser tree (null when not sampled). */
   usage?: { memoryKb: number; cpuPercent: number | null } | null;
   /** Total time this profile's browsers have been used, in seconds. */
@@ -39,6 +41,7 @@ export const ProfileCard = memo(function ProfileCard({
   onTogglePin,
   onCredentials,
   onError,
+  onMove,
   usage,
   totalSeconds,
 }: Props) {
@@ -232,6 +235,13 @@ export const ProfileCard = memo(function ProfileCard({
           ) : (
             <PinOff className="h-4 w-4" />
           )}
+        </button>
+        <button
+          onClick={() => onMove(profile)}
+          title={profile.folderId ? "Move to another folder" : "Move to a folder"}
+          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
+        >
+          <Move className="h-4 w-4" />
         </button>
         <button
           onClick={() => onEdit(profile)}

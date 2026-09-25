@@ -386,6 +386,13 @@ pub fn run() {
             commands::groups::get_groups,
             commands::groups::create_group,
             commands::groups::set_profile_groups,
+            // Folders (file-manager style organization)
+            commands::folders::get_folders,
+            commands::folders::create_folder,
+            commands::folders::rename_folder,
+            commands::folders::delete_folder,
+            commands::folders::move_folder,
+            commands::folders::move_profiles_to_folder,
             // Process
             commands::process::launch_profile,
             commands::process::stop_profile,

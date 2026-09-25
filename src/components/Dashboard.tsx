@@ -3,7 +3,10 @@ import { listen } from "@tauri-apps/api/event";
 import {
   Activity,
   AppWindow,
+  ArrowLeft,
   Download,
+  FolderOpen,
+  FolderPlus,
   History as HistoryIcon,
   Keyboard,
   Moon,
@@ -20,6 +23,7 @@ import {
 import { useProfiles } from "../hooks/useProfiles";
 import { useProxies } from "../hooks/useProxies";
 import { useGroups } from "../hooks/useGroups";
+import { useFolders } from "../hooks/useFolders";
 import { useUpdater } from "../hooks/useUpdater";
 import { useProfileFilters } from "../hooks/useProfileFilters";
 import { ProfileList } from "./ProfileList";
@@ -36,6 +40,8 @@ import { PassphraseModal } from "./PassphraseModal";
 import { DashboardHeader } from "./DashboardHeader";
 import { Toolbar } from "./Toolbar";
 import { Banners } from "./Banners";
+import { FolderCard } from "./FolderCard";
+import { FolderNameModal, FolderPickerModal } from "./FolderModals";
 import {
   exportProfiles,
   exportProfilesEncrypted,
@@ -52,13 +58,20 @@ import {
 } from "../lib/tauri-api";
 import { getVersion } from "@tauri-apps/api/app";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import type { Profile } from "../types";
+import type { Folder, Profile } from "../types";
 import type { Theme } from "../hooks/useTheme";
 
 interface Props {
   theme: Theme;
   toggleTheme: () => void;
 }
+
+/**
+ * Sentinel "folder id" for the root's unfiled view: profiles without a
+ * folder. Not a real folder — it can't be renamed/moved, and "New folder"
+ * inside it creates at the root.
+ */
+const UNFILED = "__unfiled__";
 
 /** Progress of an in-flight bulk action, fed by backend `bulk-progress` events. */
 interface BulkProgress {
@@ -73,7 +86,7 @@ interface BulkProgress {
  * Ctrl+K can replace whatever is open with the palette.
  */
 type Modal =
-  | { kind: "profileForm"; editing: Profile | null }
+  | { kind: "profileForm"; editing: Profile | null; defaultFolderId: string | null }
   | { kind: "proxyManager" }
   | { kind: "history" }
   | { kind: "help" }
@@ -84,6 +97,13 @@ type Modal =
   | { kind: "palette" }
   | { kind: "exportPassphrase"; fileName: string }
   | { kind: "importPassphrase"; fileName: string }
+  | { kind: "folderName"; editing: Folder | null; parentId: string | null }
+  | {
+      kind: "folderPicker";
+      folder: Folder | null;
+      profileIds: string[] | null;
+      currentParentId: string | null;
+    }
   | null;
 
 /** How long the "Profile deleted — Undo" banner stays actionable. */
@@ -93,7 +113,11 @@ export function Dashboard({ theme, toggleTheme }: Props) {
   const profilesState = useProfiles();
   const proxiesState = useProxies();
   const groupsState = useGroups();
+  const foldersState = useFolders();
   const updater = useUpdater();
+
+  /** Currently open folder: null = root (folders only), UNFILED = unfiled view. */
+  const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
 
   const [modal, setModal] = useState<Modal>(null);
   const [historyKey, setHistoryKey] = useState(0);
@@ -206,6 +230,41 @@ export function Dashboard({ theme, toggleTheme }: Props) {
     [proxiesState.proxies],
   );
 
+  // ---- Folder navigation (file-manager style) ------------------------------
+  const folderById = useMemo(
+    () => new Map(foldersState.folders.map((f) => [f.id, f])),
+    [foldersState.folders],
+  );
+
+  // Breadcrumb from the root down to the open folder.
+  const breadcrumb = useMemo(() => {
+    const crumbs: Folder[] = [];
+    let cur = currentFolderId && currentFolderId !== UNFILED ? folderById.get(currentFolderId) : undefined;
+    while (cur) {
+      crumbs.unshift(cur);
+      cur = cur.parentId ? folderById.get(cur.parentId) : undefined;
+    }
+    return crumbs;
+  }, [currentFolderId, folderById]);
+
+  // If the open folder disappears (deleted elsewhere), fall back to the root.
+  useEffect(() => {
+    if (currentFolderId && currentFolderId !== UNFILED && !folderById.has(currentFolderId)) {
+      setCurrentFolderId(null);
+    }
+  }, [currentFolderId, folderById]);
+
+  const inUnfiled = currentFolderId === UNFILED;
+  const inFolder = currentFolderId !== null && currentFolderId !== UNFILED;
+  const unfiledCount = profilesState.profiles.filter((p) => p.folderId == null).length;
+
+  // Subfolder tiles for the current level.
+  const childFolders = useMemo(
+    () => foldersState.folders.filter((f) => f.parentId === (inFolder ? currentFolderId : null)),
+    [foldersState.folders, inFolder, currentFolderId],
+  );
+  // --------------------------------------------------------------------------
+
   const filters = useProfileFilters({
     profiles: profilesState.profiles,
     groups: groupsState.groups,
@@ -228,6 +287,16 @@ export function Dashboard({ theme, toggleTheme }: Props) {
   } = filters;
 
   const anyModalOpen = modal !== null;
+
+  // Profiles of the open folder: the Toolbar's search/filters compose on top
+  // of the folder containment. At the root no profile list is shown at all —
+  // only folder tiles (per the file-manager layout).
+  const inFolderProfiles = useMemo(() => {
+    if (currentFolderId === null) return [];
+    return filtered.filter((p) =>
+      inUnfiled ? p.folderId == null : p.folderId === currentFolderId,
+    );
+  }, [filtered, currentFolderId, inUnfiled]);
 
   // Live progress for bulk launch/stop (fires once per profile completed).
   useEffect(() => {
@@ -425,12 +494,22 @@ export function Dashboard({ theme, toggleTheme }: Props) {
   };
 
   const openCreate = useCallback(() => {
-    setModal({ kind: "profileForm", editing: null });
+    // New profiles land in the folder the user is currently browsing.
+    setModal({
+      kind: "profileForm",
+      editing: null,
+      defaultFolderId: inFolder ? currentFolderId : null,
+    });
     // ProfileForm fetches the browser list itself — no double probe here.
-  }, []);
+  }, [inFolder, currentFolderId]);
 
   const openEdit = useCallback((profile: Profile) => {
-    setModal({ kind: "profileForm", editing: profile });
+    setModal({
+      kind: "profileForm",
+      editing: profile,
+      // Editing keeps the profile's current folder unless changed in the form.
+      defaultFolderId: profile.folderId,
+    });
   }, []);
 
   /** Delete → trash (F6) with a 30-second undo banner. */
@@ -639,44 +718,169 @@ export function Dashboard({ theme, toggleTheme }: Props) {
         </div>
       )}
 
-      <Toolbar
-        search={search}
-        onSearch={setSearch}
-        searchRef={searchRef}
-        statusFilter={statusFilter}
-        onStatusFilter={setStatusFilter}
-        browserFilter={browserFilter}
-        onBrowserFilter={setBrowserFilter}
-        browserTypes={browserTypes}
-        tagFilter={tagFilter}
-        onTagFilter={setTagFilter}
-        groups={groupsState.groups}
-        sortBy={sortBy}
-        onSortBy={setSortBy}
-        bulk={bulk}
-        onLaunchAll={launchAllStopped}
-        onStopAll={stopAllRunning}
-        onRefresh={profilesState.refresh}
-        onOpenResources={() => setModal({ kind: "resources" })}
-      />
+      {/* Folder navigation bar: back + breadcrumb + new folder. */}
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        {currentFolderId !== null && (
+          <button
+            onClick={() =>
+              setCurrentFolderId(
+                breadcrumb.length > 1 ? breadcrumb[breadcrumb.length - 2].id : null,
+              )
+            }
+            title="Back to the parent folder"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-neutral-200 text-neutral-500 hover:bg-neutral-100 dark:border-neutral-800 dark:hover:bg-neutral-800"
+          >
+            <ArrowLeft className="h-4 w-4" />
+          </button>
+        )}
+        <nav className="flex min-w-0 flex-wrap items-center gap-1 text-sm">
+          <button
+            onClick={() => setCurrentFolderId(null)}
+            className={`rounded-lg px-2 py-1 font-medium hover:bg-neutral-100 dark:hover:bg-neutral-800 ${
+              currentFolderId === null ? "text-blue-600 dark:text-blue-400" : "text-neutral-500"
+            }`}
+          >
+            Root
+          </button>
+          {inUnfiled && (
+            <>
+              <span className="text-neutral-400">/</span>
+              <span className="rounded-lg px-2 py-1 font-medium text-blue-600 dark:text-blue-400">
+                Unfiled
+              </span>
+            </>
+          )}
+          {breadcrumb.map((f, i) => (
+            <span key={f.id} className="flex items-center gap-1">
+              <span className="text-neutral-400">/</span>
+              {i === breadcrumb.length - 1 ? (
+                <span className="rounded-lg px-2 py-1 font-medium text-blue-600 dark:text-blue-400">
+                  {f.name}
+                </span>
+              ) : (
+                <button
+                  onClick={() => setCurrentFolderId(f.id)}
+                  className="rounded-lg px-2 py-1 text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                >
+                  {f.name}
+                </button>
+              )}
+            </span>
+          ))}
+        </nav>
+        <button
+          onClick={() =>
+            setModal({
+              kind: "folderName",
+              editing: null,
+              parentId: inFolder ? currentFolderId : null,
+            })
+          }
+          className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-neutral-200 px-3 py-1.5 text-xs font-medium hover:bg-neutral-100 dark:border-neutral-800 dark:hover:bg-neutral-800"
+        >
+          <FolderPlus className="h-3.5 w-3.5" /> New folder
+        </button>
+      </div>
 
-      {/* Profile grid */}
-      <ProfileList
-        profiles={filtered}
-        loading={profilesState.loading}
-        proxyById={proxyById}
-        usageById={liveUsage}
-        usageSeconds={usageSeconds}
-        onLaunch={profilesState.launch}
-        onStop={profilesState.stop}
-        onEdit={openEdit}
-        onDelete={deleteWithUndo}
-        onDuplicate={profilesState.duplicate}
-        onTogglePin={handleTogglePin}
-        onCredentials={(p) => setModal({ kind: "credentials", profile: p })}
-        onError={profilesState.setError}
-        onCreate={openCreate}
-      />
+      {/* Folder grid — visible at the root and inside folders (subfolders). */}
+      {(currentFolderId === null || inFolder) && (
+        <div className="mb-6 grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
+          {childFolders.map((f) => (
+            <FolderCard
+              key={f.id}
+              folder={f}
+              onOpen={setCurrentFolderId}
+              onRename={(folder) => setModal({ kind: "folderName", editing: folder, parentId: null })}
+              onMove={(folder) =>
+                setModal({
+                  kind: "folderPicker",
+                  folder,
+                  profileIds: null,
+                  currentParentId: folder.parentId,
+                })
+              }
+              onDeleted={() => {
+                if (currentFolderId === f.id) setCurrentFolderId(null);
+              }}
+              onError={profilesState.setError}
+            />
+          ))}
+          {/* Root only: the "unfiled" pseudo-folder for folderless profiles. */}
+          {currentFolderId === null && unfiledCount > 0 && (
+            <button
+              onClick={() => setCurrentFolderId(UNFILED)}
+              className="group flex flex-col rounded-xl border border-dashed border-neutral-300 bg-white p-5 text-left shadow-sm transition-all hover:border-neutral-400 hover:shadow dark:border-neutral-700 dark:bg-neutral-900 dark:shadow-none"
+            >
+              <div className="mb-4 flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400">
+                  <FolderOpen className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold">Unfiled</h3>
+                  <p className="mt-0.5 text-xs text-neutral-500">
+                    {unfiledCount} profile{unfiledCount === 1 ? "" : "s"}
+                  </p>
+                </div>
+              </div>
+              <p className="mt-auto text-xs text-neutral-400">
+                Profiles without a folder. Move them into a folder from inside.
+              </p>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Toolbar (search/filters/bulk) only makes sense where profiles show. */}
+      {currentFolderId !== null && (
+        <Toolbar
+          search={search}
+          onSearch={setSearch}
+          searchRef={searchRef}
+          statusFilter={statusFilter}
+          onStatusFilter={setStatusFilter}
+          browserFilter={browserFilter}
+          onBrowserFilter={setBrowserFilter}
+          browserTypes={browserTypes}
+          tagFilter={tagFilter}
+          onTagFilter={setTagFilter}
+          groups={groupsState.groups}
+          sortBy={sortBy}
+          onSortBy={setSortBy}
+          bulk={bulk}
+          onLaunchAll={launchAllStopped}
+          onStopAll={stopAllRunning}
+          onRefresh={profilesState.refresh}
+          onOpenResources={() => setModal({ kind: "resources" })}
+        />
+      )}
+
+      {/* Profile grid — only inside a folder or the unfiled view. */}
+      {currentFolderId !== null && (
+        <ProfileList
+          profiles={inFolderProfiles}
+          loading={profilesState.loading && foldersState.loading}
+          proxyById={proxyById}
+          usageById={liveUsage}
+          usageSeconds={usageSeconds}
+          onLaunch={profilesState.launch}
+          onStop={profilesState.stop}
+          onEdit={openEdit}
+          onDelete={deleteWithUndo}
+          onDuplicate={profilesState.duplicate}
+          onTogglePin={handleTogglePin}
+          onCredentials={(p) => setModal({ kind: "credentials", profile: p })}
+          onError={profilesState.setError}
+          onCreate={openCreate}
+          onMove={(p) =>
+            setModal({
+              kind: "folderPicker",
+              folder: null,
+              profileIds: [p.id],
+              currentParentId: p.folderId,
+            })
+          }
+        />
+      )}
 
       {/* Modals — A4: one union state, exactly one open at a time. */}
       {modal?.kind === "profileForm" && (
@@ -685,6 +889,8 @@ export function Dashboard({ theme, toggleTheme }: Props) {
           proxies={proxiesState.proxies}
           groups={groupsState.groups}
           defaultBrowserType={appSettings?.defaultBrowserType ?? "chromium"}
+          defaultFolderId={modal.defaultFolderId}
+          folders={foldersState.folders}
           onCreateGroup={groupsState.create}
           onClose={() => setModal(null)}
           onSubmit={async (input, groupIds) => {
@@ -753,6 +959,26 @@ export function Dashboard({ theme, toggleTheme }: Props) {
 
       {modal?.kind === "palette" && (
         <CommandPalette open onClose={() => setModal(null)} commands={paletteCommands} />
+      )}
+
+      {modal?.kind === "folderName" && (
+        <FolderNameModal
+          editing={modal.editing}
+          parentId={modal.parentId}
+          onClose={() => setModal(null)}
+          onError={profilesState.setError}
+        />
+      )}
+
+      {modal?.kind === "folderPicker" && (
+        <FolderPickerModal
+          folder={modal.folder}
+          profileIds={modal.profileIds}
+          currentParentId={modal.currentParentId}
+          folders={foldersState.folders}
+          onClose={() => setModal(null)}
+          onError={profilesState.setError}
+        />
       )}
     </div>
   );

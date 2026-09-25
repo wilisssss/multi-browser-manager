@@ -10,6 +10,7 @@ import type {
   Group,
   ImportResult,
   LaunchResult,
+  Folder,
   Profile,
   Proxy,
   ProxyTestResult,
@@ -43,6 +44,18 @@ export const getGroups = () => invoke<Group[]>("get_groups");
 export const createGroup = (name: string) => invoke<Group>("create_group", { name });
 export const setProfileGroups = (profileId: string, groupIds: string[]) =>
   invoke<void>("set_profile_groups", { profileId, groupIds });
+
+// Folders (file-manager style organization)
+export const getFolders = () => invoke<Folder[]>("get_folders");
+export const createFolder = (name: string, parentId: string | null) =>
+  invoke<Folder>("create_folder", { input: { name, parentId } });
+export const renameFolder = (id: string, name: string) =>
+  invoke<void>("rename_folder", { id, input: { name } });
+export const deleteFolder = (id: string) => invoke<void>("delete_folder", { id });
+export const moveFolder = (id: string, parentId: string | null) =>
+  invoke<void>("move_folder", { id, input: { parentId } });
+export const moveProfilesToFolder = (profileIds: string[], folderId: string | null) =>
+  invoke<void>("move_profiles_to_folder", { input: { profileIds, folderId } });
 
 // Process
 export const launchProfile = (id: string) => invoke<LaunchResult>("launch_profile", { id });

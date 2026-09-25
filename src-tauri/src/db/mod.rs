@@ -8,6 +8,7 @@ pub mod migrations {
         (4, include_str!("migrations/0004_credentials.sql")),
         (5, include_str!("migrations/0005_credentials_secrets.sql")),
         (6, include_str!("migrations/0006_extra_args_trash.sql")),
+        (7, include_str!("migrations/0007_folders.sql")),
     ];
 }
 

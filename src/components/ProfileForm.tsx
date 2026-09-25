@@ -8,6 +8,10 @@ interface Props {
   profile: Profile | null;
   proxies: Proxy[];
   groups: import("../types").Group[];
+  /** All folders, for the "which folder does this live in" select. */
+  folders: import("../types").Folder[];
+  /** Preselected folder for new profiles (the folder being browsed). */
+  defaultFolderId?: string | null;
   /** Preselected browser type for new profiles (from settings). */
   defaultBrowserType?: string;
   onCreateGroup: (name: string) => Promise<import("../types").Group>;
@@ -16,7 +20,7 @@ interface Props {
   onSubmit: (input: CreateProfileInput, groupIds: string[]) => Promise<void>;
 }
 
-export function ProfileForm({ profile, proxies, groups, defaultBrowserType, onCreateGroup, onClose, onSubmit }: Props) {
+export function ProfileForm({ profile, proxies, groups, folders, defaultFolderId, defaultBrowserType, onCreateGroup, onClose, onSubmit }: Props) {
   const [browsers, setBrowsers] = useState<BrowserInfo[]>([]);
   const [name, setName] = useState(profile?.name ?? "");
   const [browserType, setBrowserType] = useState(profile?.browserType ?? defaultBrowserType ?? "");
@@ -24,6 +28,7 @@ export function ProfileForm({ profile, proxies, groups, defaultBrowserType, onCr
   const [notes, setNotes] = useState(profile?.notes ?? "");
   const [extraArgs, setExtraArgs] = useState(profile?.extraArgs ?? "");
   const [restartOnCrash, setRestartOnCrash] = useState(profile?.restartOnCrash ?? false);
+  const [folderId, setFolderId] = useState<string>(profile?.folderId ?? defaultFolderId ?? "");
   const [stopTimeoutSecs, setStopTimeoutSecs] = useState<number | "">(
     profile?.stopTimeoutSecs ?? "",
   );
@@ -90,6 +95,7 @@ export function ProfileForm({ profile, proxies, groups, defaultBrowserType, onCr
           restartOnCrash,
           stopTimeoutSecs:
             stopTimeoutSecs === "" ? null : Math.min(60, Math.max(1, Number(stopTimeoutSecs))),
+          folderId: folderId || null,
         },
         Array.from(selectedGroups),
       );
@@ -169,6 +175,30 @@ export function ProfileForm({ profile, proxies, groups, defaultBrowserType, onCr
                   value: p.id,
                   label: `${p.label} (${p.protocol}://${p.host}:${p.port})`,
                 })),
+              ]}
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">
+              Folder
+            </label>
+            <Select
+              value={folderId}
+              onChange={setFolderId}
+              options={[
+                { value: "", label: "Unfiled" },
+                ...folders.map((f) => {
+                  // Indent by depth so nesting is visible in the dropdown.
+                  let depth = 0;
+                  let cur = f.parentId;
+                  const byId = new Map(folders.map((x) => [x.id, x]));
+                  while (cur) {
+                    depth++;
+                    cur = byId.get(cur)?.parentId ?? null;
+                  }
+                  return { value: f.id, label: `${"  ".repeat(depth)}${f.name}` };
+                }),
               ]}
             />
           </div>

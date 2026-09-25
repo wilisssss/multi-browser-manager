@@ -23,6 +23,7 @@ fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<Profile> {
         extra_args: row.get("extra_args")?,
         restart_on_crash: row.get::<_, i64>("restart_on_crash")? != 0,
         stop_timeout_secs: row.get("stop_timeout_secs")?,
+        folder_id: row.get("folder_id")?,
         groups: Vec::new(),
     })
 }
@@ -131,8 +132,8 @@ fn validate_stop_timeout(secs: Option<i64>) -> AppResult<()> {
 
 pub fn insert_profile(conn: &Connection, profile: &Profile) -> AppResult<()> {
     conn.execute(
-        "INSERT INTO profiles (id, name, browser_type, user_data_dir, proxy_id, notes, status, created_at, updated_at, last_used_at, pinned, extra_args, restart_on_crash, stop_timeout_secs)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO profiles (id, name, browser_type, user_data_dir, proxy_id, notes, status, created_at, updated_at, last_used_at, pinned, extra_args, restart_on_crash, stop_timeout_secs, folder_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             profile.id,
             profile.name,
@@ -148,6 +149,7 @@ pub fn insert_profile(conn: &Connection, profile: &Profile) -> AppResult<()> {
             profile.extra_args,
             profile.restart_on_crash as i64,
             profile.stop_timeout_secs,
+            profile.folder_id,
         ],
     )?;
     Ok(())
@@ -169,6 +171,16 @@ pub fn create_profile(
     validate_name(&conn, &input.name, None)?;
     validate_launch_fields(&input.browser_type, input.extra_args.as_deref())?;
     validate_stop_timeout(input.stop_timeout_secs)?;
+    if let Some(fid) = &input.folder_id {
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM folders WHERE id = ?1",
+            params![fid],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(AppError::validation(format!("Folder {fid} not found")));
+        }
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let user_data_dir = state
@@ -195,6 +207,7 @@ pub fn create_profile(
         extra_args: input.extra_args,
         restart_on_crash: input.restart_on_crash,
         stop_timeout_secs: input.stop_timeout_secs,
+        folder_id: input.folder_id,
         groups: Vec::new(),
     };
 
@@ -254,12 +267,30 @@ pub fn update_profile(
         Some(v) => v,
         None => existing.stop_timeout_secs,
     };
+    let folder_id = match input.folder_id {
+        Some(v) => v,
+        None => existing.folder_id.clone(),
+    };
 
     validate_launch_fields(&browser_type, extra_args.as_deref())?;
     validate_stop_timeout(stop_timeout_secs)?;
+    if let Some(fid) = &folder_id {
+        if existing.folder_id.as_deref() != Some(fid.as_str()) {
+            // Only validate when actually changing — the current value may
+            // reference a folder deleted with FKs off.
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM folders WHERE id = ?1",
+                params![fid],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(AppError::validation(format!("Folder {fid} not found")));
+            }
+        }
+    }
 
     conn.execute(
-        "UPDATE profiles SET name = ?1, browser_type = ?2, proxy_id = ?3, notes = ?4, extra_args = ?5, restart_on_crash = ?6, stop_timeout_secs = ?7, updated_at = ?8 WHERE id = ?9",
+        "UPDATE profiles SET name = ?1, browser_type = ?2, proxy_id = ?3, notes = ?4, extra_args = ?5, restart_on_crash = ?6, stop_timeout_secs = ?7, folder_id = ?8, updated_at = ?9 WHERE id = ?10",
         params![
             name,
             browser_type,
@@ -268,6 +299,7 @@ pub fn update_profile(
             extra_args,
             restart_on_crash as i64,
             stop_timeout_secs,
+            folder_id,
             chrono::Utc::now().timestamp(),
             id
         ],
@@ -420,6 +452,7 @@ pub fn duplicate_profile(
         extra_args: source.extra_args.clone(),
         restart_on_crash: source.restart_on_crash,
         stop_timeout_secs: source.stop_timeout_secs,
+        folder_id: source.folder_id.clone(),
         groups: Vec::new(),
     };
 

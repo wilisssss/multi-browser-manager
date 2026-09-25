@@ -329,6 +329,7 @@ fn apply_import(
             extra_args: profile.extra_args.clone(),
             restart_on_crash: profile.restart_on_crash,
             stop_timeout_secs: profile.stop_timeout_secs,
+            folder_id: None, // folders are local-only; imports land unfiled
             groups: Vec::new(),
         };
         insert_profile(&tx, &imported)?;
