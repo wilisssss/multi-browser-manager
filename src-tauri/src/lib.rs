@@ -380,10 +380,6 @@ pub fn run() {
             commands::profile::empty_trash,
             commands::profile::duplicate_profile,
             commands::profile::toggle_pin,
-            // Groups / tags
-            commands::groups::get_groups,
-            commands::groups::create_group,
-            commands::groups::set_profile_groups,
             // Folders (file-manager style organization)
             commands::folders::get_folders,
             commands::folders::create_folder,
@@ -412,10 +408,9 @@ pub fn run() {
             commands::backup::export_profiles_encrypted,
             commands::backup::import_profiles,
             commands::backup::get_backup_dir,
-            // Settings + window rules / workspaces
+            // Settings
             commands::settings::get_settings,
             commands::settings::update_settings,
-            commands::settings::get_window_rules,
             // Credentials (per-profile accounts; secrets in the local DB)
             commands::credentials::get_credentials,
             commands::credentials::create_credential,

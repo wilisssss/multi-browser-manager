@@ -9,6 +9,10 @@ pub mod migrations {
         (5, include_str!("migrations/0005_credentials_secrets.sql")),
         (6, include_str!("migrations/0006_extra_args_trash.sql")),
         (7, include_str!("migrations/0007_folders.sql")),
+        (8, include_str!("migrations/0008_fingerprint.sql")),
+        (9, include_str!("migrations/0009_startup_url.sql")),
+        (10, include_str!("migrations/0010_drop_extra_args_stop_timeout.sql")),
+        (11, include_str!("migrations/0011_drop_groups.sql")),
     ];
 }
 
@@ -104,12 +108,12 @@ mod tests {
         let tables: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
-                 ('profiles', 'proxies', 'groups', 'profile_groups', 'launch_history')",
+                 ('profiles', 'proxies', 'launch_history')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 5);
+        assert_eq!(tables, 3);
 
         // Migration 2's pinned column is present.
         let pinned: i64 = conn

@@ -253,8 +253,8 @@ mod tests {
     fn make_profile(conn: &Connection, id: &str, name: &str, folder: Option<&str>) {
         let now = 1;
         conn.execute(
-            "INSERT INTO profiles (id, name, browser_type, user_data_dir, proxy_id, notes, status, created_at, updated_at, last_used_at, pinned, extra_args, restart_on_crash, stop_timeout_secs, folder_id)
-             VALUES (?1, ?2, 'chromium', ?3, NULL, NULL, 'stopped', ?4, ?4, NULL, 0, NULL, 0, NULL, ?5)",
+            "INSERT INTO profiles (id, name, browser_type, user_data_dir, proxy_id, notes, status, created_at, updated_at, last_used_at, pinned, restart_on_crash, folder_id)
+             VALUES (?1, ?2, 'chromium', ?3, NULL, NULL, 'stopped', ?4, ?4, NULL, 0, 0, ?5)",
             rusqlite::params![id, name, format!("/tmp/mbm-test-{id}"), now, folder],
         )
         .unwrap();

@@ -1,6 +1,6 @@
 [package]
 name = "multi-browser-manager"
-version = "0.2.0"
+version = "0.3.0"
 description = "Manage multiple isolated Chromium browser profiles from one dashboard"
 authors = ["MBM"]
 edition = "2021"
@@ -32,10 +32,14 @@ chrono = { version = "0.4", features = ["serde"] }
 which = "6"
 directories = "5"
 keyring = { version = "3", features = ["sync-secret-service"] }
-reqwest = { version = "0.12", default-features = false, features = ["socks", "json", "rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["socks", "json", "rustls-tls"] }
 thiserror = "1"
 notify-rust = "4"
 percent-encoding = "2"
+url = "2"
+# Chrome DevTools Protocol client (local ws:// only, no TLS needed).
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
 # Encrypted backup export (feature): argon2id KDF + AES-256-GCM.
 aes-gcm = "0.10"
 argon2 = "0.5"

@@ -1,7 +1,6 @@
 import { Play, Activity, RefreshCw, Search, Square } from "lucide-react";
 import { Select } from "./Select";
 import { SORT_OPTIONS, type SortKey } from "../hooks/useProfileFilters";
-import type { Group } from "../types";
 
 interface Props {
   search: string;
@@ -12,9 +11,6 @@ interface Props {
   browserFilter: string;
   onBrowserFilter: (v: string) => void;
   browserTypes: string[];
-  tagFilter: string;
-  onTagFilter: (v: string) => void;
-  groups: Group[];
   sortBy: SortKey;
   onSortBy: (v: SortKey) => void;
   /** Live progress of a bulk action (from backend `bulk-progress` events). */
@@ -37,9 +33,6 @@ export function Toolbar(props: Props) {
     browserFilter,
     onBrowserFilter,
     browserTypes,
-    tagFilter,
-    onTagFilter,
-    groups,
     sortBy,
     onSortBy,
     bulk,
@@ -83,16 +76,6 @@ export function Toolbar(props: Props) {
         options={[
           { value: "all", label: "All browsers" },
           ...browserTypes.map((t) => ({ value: t, label: t })),
-        ]}
-      />
-
-      <Select
-        className="w-40"
-        value={tagFilter}
-        onChange={onTagFilter}
-        options={[
-          { value: "all", label: "All tags" },
-          ...groups.map((g) => ({ value: g.id, label: g.name })),
         ]}
       />
 

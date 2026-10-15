@@ -54,7 +54,7 @@ pub fn generate_auth_proxy_extension(
     username: &str,
     password: &str,
 ) -> AppResult<PathBuf> {
-    let dir = extension_root().join(sanitize(profile_id));
+    let dir = profile_extension_dir(profile_id).join("proxy");
     let scripts = dir.join("scripts");
 
     // Create the directory with restrictive permissions BEFORE anything is
@@ -134,7 +134,7 @@ chrome.webRequest.onAuthRequired.addListener(
 }
 
 /// Writes a file with owner-only permissions (0o600 on unix).
-fn write_private_file(path: &Path, contents: String) -> AppResult<()> {
+pub(crate) fn write_private_file(path: &Path, contents: String) -> AppResult<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -157,9 +157,15 @@ fn write_private_file(path: &Path, contents: String) -> AppResult<()> {
     Ok(())
 }
 
+/// Root of every generated extension for one profile (`<root>/<id>/proxy`,
+/// `<root>/<id>/fingerprint`). Removing it cleans up all of them at once.
+pub fn profile_extension_dir(profile_id: &str) -> PathBuf {
+    extension_root().join(sanitize(profile_id))
+}
+
 /// Removes a generated extension directory (called when the profile stops).
 pub fn cleanup_extension(profile_id: &str) {
-    let dir = extension_root().join(sanitize(profile_id));
+    let dir = profile_extension_dir(profile_id);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -241,27 +247,7 @@ pub async fn test_proxy_connection(
 ) -> AppResult<crate::models::proxy::ProxyTestResult> {
     let started = std::time::Instant::now();
 
-    // SOCKS5 auth must be passed via URL credentials — reqwest's `basic_auth`
-    // only works for HTTP proxies. HTTP auth still uses basic_auth().
-    let has_auth = username.map(|u| !u.is_empty()).unwrap_or(false);
-    let proxy_url = match protocol {
-        "socks5" if has_auth => format!(
-            "socks5://{}:{}@{host}:{port}",
-            encode_credential(username.unwrap_or("")),
-            encode_credential(password.unwrap_or(""))
-        ),
-        _ => format!("{protocol}://{host}:{port}"),
-    };
-    let mut proxy = reqwest::Proxy::all(&proxy_url)?;
-
-    if has_auth && protocol != "socks5" {
-        proxy = proxy.basic_auth(username.unwrap_or(""), password.unwrap_or(""));
-    }
-
-    let client = reqwest::Client::builder()
-        .proxy(proxy)
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    let client = build_proxy_client(protocol, host, port, username, password, 10)?;
 
     match client.get("https://api.ipify.org?format=json").send().await {
         Ok(resp) => {
@@ -288,6 +274,71 @@ pub async fn test_proxy_connection(
     }
 }
 
+/// Client routed through the proxy, used by the connection test and by the
+/// launch-time timezone lookup.
+fn build_proxy_client(
+    protocol: &str,
+    host: &str,
+    port: i64,
+    username: Option<&str>,
+    password: Option<&str>,
+    timeout_secs: u64,
+) -> AppResult<reqwest::Client> {
+    // SOCKS5 auth must be passed via URL credentials — reqwest's `basic_auth`
+    // only works for HTTP proxies. HTTP auth still uses basic_auth().
+    let has_auth = username.map(|u| !u.is_empty()).unwrap_or(false);
+    let proxy_url = match protocol {
+        "socks5" if has_auth => format!(
+            "socks5://{}:{}@{host}:{port}",
+            encode_credential(username.unwrap_or("")),
+            encode_credential(password.unwrap_or(""))
+        ),
+        _ => format!("{protocol}://{host}:{port}"),
+    };
+    let mut proxy = reqwest::Proxy::all(&proxy_url)?;
+
+    if has_auth && protocol != "socks5" {
+        proxy = proxy.basic_auth(username.unwrap_or(""), password.unwrap_or(""));
+    }
+
+    Ok(reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()?)
+}
+
+/// Timezone of the proxy's exit IP, or `None` when the lookup fails. Used at
+/// launch so a proxied profile reports the zone its traffic appears from.
+pub fn lookup_timezone_via_proxy(
+    protocol: &str,
+    host: &str,
+    port: i64,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Option<String> {
+    let client = build_proxy_client(protocol, host, port, username, password, 5).ok()?;
+    tauri::async_runtime::block_on(async {
+        let text = client
+            .get("https://ipapi.co/timezone/")
+            .send()
+            .await
+            .ok()?
+            .text()
+            .await
+            .ok()?;
+        let tz = text.trim().to_string();
+        is_plausible_timezone(&tz).then_some(tz)
+    })
+}
+
+/// IANA-style name such as `Europe/Berlin` (or `UTC`). Rejects error pages.
+pub fn is_plausible_timezone(tz: &str) -> bool {
+    tz == "UTC"
+        || (tz.len() <= 64
+            && tz.contains('/')
+            && tz.chars().all(|c| c.is_ascii_alphanumeric() || "/_+-".contains(c)))
+}
+
 /// Whether a proxy protocol can be used by Chromium's `--proxy-server` flag.
 pub fn is_supported_protocol(p: &str) -> bool {
     matches!(p, "http" | "socks5")
@@ -301,10 +352,6 @@ pub fn ensure_valid_protocol(p: &str) -> AppResult<()> {
             "Unsupported proxy protocol: {p} (expected http or socks5)"
         )))
     }
-}
-
-pub fn extension_dir_exists(path: &Path) -> bool {
-    path.join("manifest.json").is_file() && path.join("background.js").is_file()
 }
 
 #[cfg(test)]
@@ -322,8 +369,6 @@ mod tests {
             "s3cr3t\"quote",
         )
         .expect("generate extension");
-
-        assert!(extension_dir_exists(&dir));
 
         let bg = std::fs::read_to_string(dir.join("background.js")).unwrap();
         assert!(bg.contains(r#"host: "proxy.example.com""#));

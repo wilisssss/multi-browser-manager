@@ -135,19 +135,6 @@ pub struct UpdateCredentialInput {
     pub notes: Option<Option<String>>,
 }
 
-/// Deserializes JSON `null` as `Some(None)` while an absent field stays `None`,
-/// so "clear this secret" can be distinguished from "leave it unchanged".
-// Only exercised from tests right now (see double_option_distinguishes_null_from_absent);
-// keep it available for future DTOs without tripping the dead_code lint.
-#[cfg_attr(not(test), allow(dead_code))]
-fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    T: Deserialize<'de>,
-    D: serde::Deserializer<'de>,
-{
-    Deserialize::deserialize(de).map(Some)
-}
-
 fn row_to_credential(row: &rusqlite::Row<'_>) -> rusqlite::Result<Credential> {
     Ok(Credential {
         id: row.get("id")?,
@@ -384,24 +371,6 @@ mod tests {
         )
         .unwrap();
         conn
-    }
-
-    #[test]
-    fn double_option_distinguishes_null_from_absent() {
-        #[derive(Deserialize)]
-        struct In {
-            #[serde(default, deserialize_with = "double_option")]
-            password: Option<Option<String>>,
-        }
-        // Absent → keep (None).
-        let i: In = serde_json::from_str("{}").unwrap();
-        assert!(i.password.is_none());
-        // null → clear (Some(None)).
-        let i: In = serde_json::from_str(r#"{"password": null}"#).unwrap();
-        assert_eq!(i.password, Some(None));
-        // Value → replace.
-        let i: In = serde_json::from_str(r#"{"password": "s3cret"}"#).unwrap();
-        assert_eq!(i.password, Some(Some("s3cret".into())));
     }
 
     #[test]

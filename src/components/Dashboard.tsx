@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Activity,
-  AppWindow,
   ArrowLeft,
   Download,
   FolderOpen,
@@ -22,7 +21,6 @@ import {
 } from "lucide-react";
 import { useProfiles } from "../hooks/useProfiles";
 import { useProxies } from "../hooks/useProxies";
-import { useGroups } from "../hooks/useGroups";
 import { useFolders } from "../hooks/useFolders";
 import { useProfileFilters } from "../hooks/useProfileFilters";
 import { ProfileList } from "./ProfileList";
@@ -32,7 +30,6 @@ import { HistoryModal } from "./HistoryModal";
 import { ShortcutsHelp } from "./ShortcutsHelp";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { SettingsModal } from "./SettingsModal";
-import { WindowRulesModal } from "./WindowRulesModal";
 import { CredentialsModal } from "./CredentialsModal";
 import { ResourcesModal } from "./ResourcesModal";
 import { PassphraseModal } from "./PassphraseModal";
@@ -42,23 +39,18 @@ import { Banners } from "./Banners";
 import { FolderCard } from "./FolderCard";
 import { FolderNameModal, FolderPickerModal } from "./FolderModals";
 import {
-  exportProfiles,
-  exportProfilesEncrypted,
-  importProfiles,
-  bulkLaunch,
-  bulkStop,
-  setProfileGroups,
   togglePin,
   getSettings,
-  updateSettings,
   getUsageStats,
   getResourceUsage,
   restoreProfile,
 } from "../lib/tauri-api";
 import { getVersion } from "@tauri-apps/api/app";
-import { save, open } from "@tauri-apps/plugin-dialog";
 import type { Folder, Profile } from "../types";
 import type { Theme } from "../hooks/useTheme";
+import { useBackupActions } from "../hooks/useBackupActions";
+import { useBulkActions } from "../hooks/useBulkActions";
+import type { Modal } from "./modalTypes";
 
 interface Props {
   theme: Theme;
@@ -72,38 +64,12 @@ interface Props {
  */
 const UNFILED = "__unfiled__";
 
-/** Progress of an in-flight bulk action, fed by backend `bulk-progress` events. */
-interface BulkProgress {
-  action: "launch" | "stop";
-  done: number;
-  total: number;
-}
 
 /**
  * A4: one discriminated-union state instead of eight booleans. Only the top
  * modal exists at a time, so Escape always closes exactly one modal (L13) and
  * Ctrl+K can replace whatever is open with the palette.
  */
-type Modal =
-  | { kind: "profileForm"; editing: Profile | null; defaultFolderId: string | null }
-  | { kind: "proxyManager" }
-  | { kind: "history" }
-  | { kind: "help" }
-  | { kind: "settings" }
-  | { kind: "rules" }
-  | { kind: "credentials"; profile: Profile }
-  | { kind: "resources" }
-  | { kind: "palette" }
-  | { kind: "exportPassphrase"; fileName: string }
-  | { kind: "importPassphrase"; fileName: string }
-  | { kind: "folderName"; editing: Folder | null; parentId: string | null }
-  | {
-      kind: "folderPicker";
-      folder: Folder | null;
-      profileIds: string[] | null;
-      currentParentId: string | null;
-    }
-  | null;
 
 /** How long the "Profile deleted — Undo" banner stays actionable. */
 const UNDO_WINDOW_MS = 30_000;
@@ -111,7 +77,6 @@ const UNDO_WINDOW_MS = 30_000;
 export function Dashboard({ theme, toggleTheme }: Props) {
   const profilesState = useProfiles();
   const proxiesState = useProxies();
-  const groupsState = useGroups();
   const foldersState = useFolders();
 
   /** Currently open folder: null = root (folders only), UNFILED = unfiled view. */
@@ -122,7 +87,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
   const [appSettings, setAppSettings] = useState<import("../types").AppSettings | null>(null);
   const [appVersion, setAppVersion] = useState<string>("");
   const [busy, setBusy] = useState(false);
-  const [bulk, setBulk] = useState<BulkProgress | null>(null);
   /** F6: last deleted profile + deadline, for the undo banner. */
   const [undoTrash, setUndoTrash] = useState<{ id: string; name: string; until: number } | null>(null);
   /** F5: total browser seconds per profile id. */
@@ -147,13 +111,13 @@ export function Dashboard({ theme, toggleTheme }: Props) {
   const runningCount = profilesState.profiles.filter((p) => p.status === "running").length;
 
   // Refresh when the backend signals external changes (e.g. `mbm --launch` from a WM keybind).
+  const { refresh } = profilesState;
   useEffect(() => {
-    const unlistenPromise = listen("profiles-changed", () => profilesState.refresh());
+    const unlistenPromise = listen("profiles-changed", () => refresh());
     return () => {
       unlistenPromise.then((fn) => fn());
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [refresh]);
 
   // Usage statistics (F5): refetch together with the profile list — the
   // cheapest correct trigger, since launches/stops change both.
@@ -205,23 +169,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
     return () => clearTimeout(t);
   }, [undoTrash]);
 
-  /** Persists one tag → workspace mapping change. */
-  const handleWorkspaceChange = useCallback(
-    async (groupId: string, workspace: number | null) => {
-      setAppSettings((prev) => {
-        if (!prev) return prev;
-        const groupWorkspaces = { ...prev.groupWorkspaces };
-        if (workspace === null) delete groupWorkspaces[groupId];
-        else groupWorkspaces[groupId] = workspace;
-        const next = { ...prev, groupWorkspaces };
-        // Fire-and-forget persist; failures resurface via reload on next open.
-        updateSettings(next).catch(() => {});
-        return next;
-      });
-    },
-    [],
-  );
-
   // O(1) proxy lookup per card instead of an O(P×Q) Array.find per render.
   const proxyById = useMemo(
     () => new Map(proxiesState.proxies.map((p) => [p.id, p])),
@@ -265,7 +212,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
 
   const filters = useProfileFilters({
     profiles: profilesState.profiles,
-    groups: groupsState.groups,
     usageSeconds,
   });
   const {
@@ -275,8 +221,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
     setStatusFilter,
     browserFilter,
     setBrowserFilter,
-    tagFilter,
-    setTagFilter,
     sortBy,
     setSortBy,
     browserTypes,
@@ -285,6 +229,21 @@ export function Dashboard({ theme, toggleTheme }: Props) {
   } = filters;
 
   const anyModalOpen = modal !== null;
+
+  const { bulk, launchAllStopped, stopAllRunning } = useBulkActions({
+    profiles: profilesState.profiles,
+    filtered,
+    refresh,
+    setError: profilesState.setError,
+    setBusy,
+  });
+  const { handleExport, handleImport } = useBackupActions({
+    refresh,
+    refreshProxies: proxiesState.refresh,
+    setError: profilesState.setError,
+    setModal,
+    setBusy,
+  });
 
   // Profiles of the open folder: the Toolbar's search/filters compose on top
   // of the folder containment. At the root no profile list is shown at all —
@@ -295,20 +254,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
       inUnfiled ? p.folderId == null : p.folderId === currentFolderId,
     );
   }, [filtered, currentFolderId, inUnfiled]);
-
-  // Live progress for bulk launch/stop (fires once per profile completed).
-  useEffect(() => {
-    const unlistenPromise = listen<BulkProgress & { profileId: string; success: boolean }>(
-      "bulk-progress",
-      (event) => {
-        const { action, done, total } = event.payload;
-        setBulk({ action, done, total });
-      },
-    );
-    return () => {
-      unlistenPromise.then((fn) => fn());
-    };
-  }, []);
 
   // Global keyboard shortcuts (ignored while typing or when a modal is open).
   useEffect(() => {
@@ -359,137 +304,7 @@ export function Dashboard({ theme, toggleTheme }: Props) {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [anyModalOpen, toggleTheme]);
-
-  const handleExport = async (passphrase?: string) => {
-    const fileName = "mbm-backup.json";
-    const path = await save({
-      title: "Export profiles",
-      defaultPath: fileName,
-      filters: [{ name: "JSON", extensions: ["json"] }],
-    });
-    if (!path) return;
-    if (passphrase === undefined) {
-      // First step: ask whether to encrypt (empty = plaintext).
-      setModal({ kind: "exportPassphrase", fileName: path });
-      return;
-    }
-    try {
-      setBusy(true);
-      if (passphrase) {
-        await exportProfilesEncrypted(path, passphrase);
-      } else {
-        await exportProfiles(path);
-      }
-      setModal(null);
-    } catch (e) {
-      profilesState.setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const handleImport = async (passphrase?: string) => {
-    const path = await open({
-      title: "Import profiles",
-      multiple: false,
-      filters: [{ name: "JSON", extensions: ["json"] }],
-    });
-    if (!path || Array.isArray(path)) return;
-    if (passphrase === undefined) {
-      // Try plaintext first; an encrypted file errors with a clear message and
-      // we reopen this flow with the passphrase prompt (import retry).
-      try {
-        setBusy(true);
-        await importProfiles(path);
-        await Promise.all([profilesState.refresh(), proxiesState.refresh()]);
-        return;
-      } catch (e) {
-        const message = String(e);
-        if (message.toLowerCase().includes("passphrase") || message.toLowerCase().includes("encrypted")) {
-          setModal({ kind: "importPassphrase", fileName: path });
-          return;
-        }
-        profilesState.setError(message);
-        return;
-      } finally {
-        setBusy(false);
-      }
-    }
-    try {
-      setBusy(true);
-      const result = await importProfiles(path, passphrase || undefined);
-      await Promise.all([profilesState.refresh(), proxiesState.refresh()]);
-      setModal(null);
-      const summary =
-        `Imported ${result.importedProfiles} profiles, ${result.importedProxies} proxies, ` +
-        `${result.importedCredentials} credentials. ` +
-        `Skipped: ${result.skippedProfiles} profiles, ${result.skippedProxies} proxies, ` +
-        `${result.skippedCredentials} credentials.`;
-      // Surface skipped/conflict info even on success — those are expected
-      // outcomes, not errors, but the user must see them.
-      profilesState.setError(result.conflicts.length > 0 ? summary : null);
-    } catch (e) {
-      // Wrong passphrase etc. — stay in the prompt so the user can retry.
-      throw e;
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const launchAllStopped = async () => {
-    const ids = filtered.filter((p) => p.status === "stopped").map((p) => p.id);
-    if (ids.length === 0) return;
-    setBusy(true);
-    setBulk({ action: "launch", done: 0, total: ids.length });
-    try {
-      const results = await bulkLaunch(ids);
-      await profilesState.refresh();
-      reportBulkFailures(results, "launch");
-    } catch (e) {
-      profilesState.setError(String(e));
-    } finally {
-      setBulk(null);
-      setBusy(false);
-    }
-  };
-
-  const stopAllRunning = async () => {
-    const ids = filtered.filter((p) => p.status === "running").map((p) => p.id);
-    if (ids.length === 0) return;
-    setBusy(true);
-    setBulk({ action: "stop", done: 0, total: ids.length });
-    try {
-      const results = await bulkStop(ids);
-      await profilesState.refresh();
-      reportBulkFailures(results, "stop");
-    } catch (e) {
-      profilesState.setError(String(e));
-    } finally {
-      setBulk(null);
-      setBusy(false);
-    }
-  };
-
-  /** Surfaces per-profile bulk failures that the backend collected. */
-  const reportBulkFailures = (
-    results: { profileId: string; success: boolean; message: string }[],
-    action: string,
-  ) => {
-    const failures = results.filter((r) => !r.success);
-    if (failures.length === 0) return;
-    const names = failures
-      .map((f) => {
-        const p = profilesState.profiles.find((x) => x.id === f.profileId);
-        return p?.name ?? f.profileId;
-      })
-      .join(", ");
-    const firstError = failures[0].message;
-    profilesState.setError(
-      `Failed to ${action} ${failures.length} profile(s): ${names}. First error: ${firstError}`,
-    );
-  };
+  }, [anyModalOpen, toggleTheme, searchRef]);
 
   const openCreate = useCallback(() => {
     // New profiles land in the folder the user is currently browsing.
@@ -547,12 +362,12 @@ export function Dashboard({ theme, toggleTheme }: Props) {
       label: p.name,
       section: "Profiles",
       hint: p.status === "running" ? "running · stop" : "stopped · launch",
-      keywords: [p.browserType, p.notes ?? "", ...p.groups.map((g) => g.name)]
-        .filter(Boolean)
-        .join(" "),
+      keywords: [p.browserType, p.notes ?? ""].filter(Boolean).join(" "),
       icon: p.status === "running" ? Square : Play,
       action: () =>
-        p.status === "running" ? profilesState.stop(p.id) : profilesState.launch(p.id),
+        (p.status === "running" ? profilesState.stop(p.id) : profilesState.launch(p.id)).catch(
+          (e) => profilesState.setError(String(e)),
+        ),
     })),
     {
       id: "new-profile",
@@ -641,13 +456,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
       action: () => setModal({ kind: "help" }),
     },
     {
-      id: "window-rules",
-      label: "Window rules & workspaces",
-      section: "Actions",
-      icon: AppWindow,
-      action: () => setModal({ kind: "rules" }),
-    },
-    {
       id: "settings",
       label: "Settings",
       section: "Actions",
@@ -664,7 +472,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
         runningCount={runningCount}
         appVersion={appVersion}
         onOpenPalette={() => setModal({ kind: "palette" })}
-        onOpenRules={() => setModal({ kind: "rules" })}
         onOpenSettings={() => setModal({ kind: "settings" })}
         onOpenHistory={() => {
           setHistoryKey((k) => k + 1);
@@ -672,11 +479,8 @@ export function Dashboard({ theme, toggleTheme }: Props) {
         }}
         onOpenHelp={() => setModal({ kind: "help" })}
         onToggleTheme={toggleTheme}
-        onImport={() => handleImport()}
-        onExport={() => handleExport()}
         onOpenProxies={() => setModal({ kind: "proxyManager" })}
         onCreate={openCreate}
-        busy={busy}
       />
 
       <Banners error={profilesState.error} onDismissError={() => profilesState.setError(null)} />
@@ -824,9 +628,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
           browserFilter={browserFilter}
           onBrowserFilter={setBrowserFilter}
           browserTypes={browserTypes}
-          tagFilter={tagFilter}
-          onTagFilter={setTagFilter}
-          groups={groupsState.groups}
           sortBy={sortBy}
           onSortBy={setSortBy}
           bulk={bulk}
@@ -870,17 +671,13 @@ export function Dashboard({ theme, toggleTheme }: Props) {
         <ProfileForm
           profile={modal.editing}
           proxies={proxiesState.proxies}
-          groups={groupsState.groups}
           defaultBrowserType={appSettings?.defaultBrowserType ?? "chromium"}
           defaultFolderId={modal.defaultFolderId}
           folders={foldersState.folders}
-          onCreateGroup={groupsState.create}
           onClose={() => setModal(null)}
-          onSubmit={async (input, groupIds) => {
-            const saved = modal.editing
-              ? await profilesState.update(modal.editing.id, input)
-              : await profilesState.create(input);
-            await setProfileGroups(saved.id, groupIds);
+          onSubmit={async (input) => {
+            if (modal.editing) await profilesState.update(modal.editing.id, input);
+            else await profilesState.create(input);
             await profilesState.refresh();
             setModal(null);
           }}
@@ -899,15 +696,9 @@ export function Dashboard({ theme, toggleTheme }: Props) {
         <SettingsModal
           onClose={() => setModal(null)}
           onSaved={(s) => setAppSettings(s)}
-        />
-      )}
-
-      {modal?.kind === "rules" && (
-        <WindowRulesModal
-          groups={groupsState.groups}
-          settings={appSettings}
-          onWorkspaceChange={handleWorkspaceChange}
-          onClose={() => setModal(null)}
+          onExport={() => handleExport()}
+          onImport={() => handleImport()}
+          busy={busy}
         />
       )}
 

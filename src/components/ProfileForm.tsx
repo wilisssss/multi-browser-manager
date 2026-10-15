@@ -1,42 +1,51 @@
 import { useEffect, useState } from "react";
-import { Loader2, Plus, X } from "lucide-react";
+import { Loader2, X } from "lucide-react";
 import { detectBrowsers } from "../lib/tauri-api";
+import { PHONE_DEVICES, phoneByUserAgent } from "../lib/userAgents";
 import { Select } from "./Select";
-import type { BrowserInfo, CreateProfileInput, Profile, Proxy } from "../types";
+import type { BrowserInfo, CreateProfileInput, Fingerprint, Profile, Proxy } from "../types";
 
 interface Props {
   profile: Profile | null;
   proxies: Proxy[];
-  groups: import("../types").Group[];
   /** All folders, for the "which folder does this live in" select. */
   folders: import("../types").Folder[];
   /** Preselected folder for new profiles (the folder being browsed). */
   defaultFolderId?: string | null;
   /** Preselected browser type for new profiles (from settings). */
   defaultBrowserType?: string;
-  onCreateGroup: (name: string) => Promise<import("../types").Group>;
   onClose: () => void;
-  /** Second argument = tag ids to assign to the saved profile. */
-  onSubmit: (input: CreateProfileInput, groupIds: string[]) => Promise<void>;
+  onSubmit: (input: CreateProfileInput) => Promise<void>;
 }
 
-export function ProfileForm({ profile, proxies, groups, folders, defaultFolderId, defaultBrowserType, onCreateGroup, onClose, onSubmit }: Props) {
+export function ProfileForm({ profile, proxies, folders, defaultFolderId, defaultBrowserType, onClose, onSubmit }: Props) {
   const [browsers, setBrowsers] = useState<BrowserInfo[]>([]);
   const [name, setName] = useState(profile?.name ?? "");
   const [browserType, setBrowserType] = useState(profile?.browserType ?? defaultBrowserType ?? "");
   const [proxyId, setProxyId] = useState<string>(profile?.proxyId ?? "");
   const [notes, setNotes] = useState(profile?.notes ?? "");
-  const [extraArgs, setExtraArgs] = useState(profile?.extraArgs ?? "");
+  const [startupUrl, setStartupUrl] = useState(profile?.startupUrl ?? "");
   const [restartOnCrash, setRestartOnCrash] = useState(profile?.restartOnCrash ?? false);
   const [folderId, setFolderId] = useState<string>(profile?.folderId ?? defaultFolderId ?? "");
-  const [stopTimeoutSecs, setStopTimeoutSecs] = useState<number | "">(
-    profile?.stopTimeoutSecs ?? "",
+  const fp = profile?.fingerprint ?? null;
+  const [language, setLanguage] = useState(fp?.language ?? "");
+  /** UA dropdown value: "" = default, a device id, or "custom". */
+  const initialPhone = phoneByUserAgent(fp?.userAgent);
+  const [uaMode, setUaMode] = useState<string>(
+    initialPhone ? initialPhone.id : fp?.userAgent ? "custom" : "",
   );
-  const [selectedGroups, setSelectedGroups] = useState<Set<string>>(
-    () => new Set(profile?.groups.map((g) => g.id) ?? []),
+  const [customUserAgent, setCustomUserAgent] = useState(
+    initialPhone ? "" : (fp?.userAgent ?? ""),
   );
-  const [newTag, setNewTag] = useState("");
-  const [addingTag, setAddingTag] = useState(false);
+  const [screenText, setScreenText] = useState(
+    fp?.screen ? `${fp.screen.width}x${fp.screen.height}` : "",
+  );
+  const [timezone, setTimezone] = useState(fp?.timezone ?? "");
+  const [platform, setPlatform] = useState(fp?.platform ?? "");
+  const [geoLat, setGeoLat] = useState<number | "">(fp?.geolocation?.latitude ?? "");
+  const [geoLon, setGeoLon] = useState<number | "">(fp?.geolocation?.longitude ?? "");
+  const [fontsText, setFontsText] = useState((fp?.fonts ?? []).join(", "));
+  const [disableWebRTC, setDisableWebRTC] = useState(fp?.disableWebRTC ?? false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -52,28 +61,51 @@ export function ProfileForm({ profile, proxies, groups, folders, defaultFolderId
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const toggleGroup = (id: string) => {
-    setSelectedGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  /** Picks a UA option. A phone device also fills the portrait screen size. */
+  const chooseUaMode = (mode: string) => {
+    setUaMode(mode);
+    const device = PHONE_DEVICES.find((d) => d.id === mode);
+    if (device) {
+      setScreenText(`${device.screen.width}x${device.screen.height}`);
+    }
   };
 
-  const handleAddTag = async () => {
-    const trimmed = newTag.trim();
-    if (!trimmed) return;
-    setAddingTag(true);
-    try {
-      const group = await onCreateGroup(trimmed);
-      setSelectedGroups((prev) => new Set(prev).add(group.id));
-      setNewTag("");
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setAddingTag(false);
-    }
+  const userAgentValue = (): string | null => {
+    if (uaMode === "custom") return customUserAgent.trim() || null;
+    const device = PHONE_DEVICES.find((d) => d.id === uaMode);
+    return device ? device.userAgent : null;
+  };
+
+  /** Parses "WIDTHxHEIGHT" (x or ×). Empty = no override. */
+  const parseScreen = (): { width: number; height: number } | null | "invalid" => {
+    const raw = screenText.trim();
+    if (!raw) return null;
+    const m = raw.match(/^(\d+)\s*[x×]\s*(\d+)$/i);
+    if (!m) return "invalid";
+    return { width: Number(m[1]), height: Number(m[2]) };
+  };
+
+  /** Builds the fingerprint from the form; empty fields are left unset. */
+  const buildFingerprint = (): Fingerprint | null => {
+    const screen = parseScreen();
+    const fonts = fontsText
+      .split(",")
+      .map((f) => f.trim())
+      .filter(Boolean);
+    const hasGeo = geoLat !== "" && geoLon !== "";
+    const fp: Fingerprint = {
+      language: language.trim() || null,
+      userAgent: userAgentValue(),
+      timezone: timezone.trim() || null,
+      platform: platform.trim() || null,
+      geolocation: hasGeo ? { latitude: Number(geoLat), longitude: Number(geoLon) } : null,
+      fonts: fonts.length > 0 ? fonts : null,
+      screen: screen === "invalid" ? null : screen,
+      // Only sent when on: the backend field is a plain bool, not an Option.
+      ...(disableWebRTC ? { disableWebRTC: true } : {}),
+    };
+    const empty = Object.values(fp).every((v) => v === null);
+    return empty ? null : fp;
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -82,23 +114,27 @@ export function ProfileForm({ profile, proxies, groups, folders, defaultFolderId
       setError("Name and browser are required.");
       return;
     }
+    if ((geoLat === "") !== (geoLon === "")) {
+      setError("Geolocation needs both latitude and longitude.");
+      return;
+    }
+    if (parseScreen() === "invalid") {
+      setError("Screen size must look like 412x915.");
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
-      await onSubmit(
-        {
-          name: name.trim(),
-          browserType,
-          proxyId: proxyId || null,
-          notes: notes.trim() || null,
-          extraArgs: extraArgs.trim() || null,
-          restartOnCrash,
-          stopTimeoutSecs:
-            stopTimeoutSecs === "" ? null : Math.min(60, Math.max(1, Number(stopTimeoutSecs))),
-          folderId: folderId || null,
-        },
-        Array.from(selectedGroups),
-      );
+      await onSubmit({
+        name: name.trim(),
+        browserType,
+        proxyId: proxyId || null,
+        notes: notes.trim() || null,
+        restartOnCrash,
+        folderId: folderId || null,
+        fingerprint: buildFingerprint(),
+        startupUrl: startupUrl.trim() || null,
+      });
     } catch (err) {
       setError(String(err));
     } finally {
@@ -108,7 +144,7 @@ export function ProfileForm({ profile, proxies, groups, folders, defaultFolderId
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-md rounded-xl border border-neutral-200 bg-white p-6 shadow-xl dark:border-neutral-800 dark:bg-neutral-900">
+      <div className="flex max-h-[90vh] w-full max-w-md flex-col rounded-xl border border-neutral-200 bg-white p-6 shadow-xl dark:border-neutral-800 dark:bg-neutral-900">
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-semibold">
             {profile ? "Edit Profile" : "New Profile"}
@@ -124,7 +160,7 @@ export function ProfileForm({ profile, proxies, groups, folders, defaultFolderId
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={handleSubmit} className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
           <div>
             <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">Name</label>
             <input
@@ -203,103 +239,99 @@ export function ProfileForm({ profile, proxies, groups, folders, defaultFolderId
             />
           </div>
 
-          <div>
-            <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">
-              Tags (optional)
-            </label>
-            {groups.length > 0 && (
-              <div className="mb-2 flex flex-wrap gap-1.5">
-                {groups.map((g) => {
-                  const active = selectedGroups.has(g.id);
-                  const color = g.color ?? "#3b82f6";
-                  return (
-                    <button
-                      key={g.id}
-                      type="button"
-                      onClick={() => toggleGroup(g.id)}
-                      className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs transition-colors ${
-                        active
-                          ? "border-transparent"
-                          : "border-neutral-300 text-neutral-600 hover:border-neutral-400 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-neutral-600"
-                      }`}
-                      style={
-                        active
-                          ? { backgroundColor: `${color}26`, color, borderColor: color }
-                          : undefined
-                      }
-                    >
-                      {g.name}
-                    </button>
-                  );
-                })}
+          <label className="flex items-center gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
+            <input
+              type="checkbox"
+              checked={restartOnCrash}
+              onChange={(e) => setRestartOnCrash(e.target.checked)}
+              className="h-4 w-4 accent-blue-600"
+            />
+            Auto-restart on crash
+          </label>
+
+          <details className="rounded-lg border border-neutral-200 p-3 dark:border-neutral-800">
+            <summary className="cursor-pointer text-xs font-medium text-neutral-600 dark:text-neutral-300">
+              Fingerprint (optional)
+            </summary>
+            <p className="mb-3 mt-2 text-xs text-neutral-400 dark:text-neutral-500">
+              Empty fields keep the browser's own values. Overrides are
+              best-effort; sites may still detect the browser.
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <FpField label="Language" placeholder="en-US" value={language} onChange={setLanguage} />
+              <FpField label="Platform" placeholder="Win32" value={platform} onChange={setPlatform} />
+              <FpField label="Timezone" placeholder="Europe/Berlin" value={timezone} onChange={setTimezone} className="col-span-2" />
+              <div className="col-span-2">
+                <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">User agent</label>
+                <Select
+                  value={uaMode}
+                  onChange={chooseUaMode}
+                  options={[
+                    { value: "", label: "Default (browser)" },
+                    ...PHONE_DEVICES.map((d) => ({ value: d.id, label: `Phone · ${d.name}` })),
+                    { value: "custom", label: "Custom" },
+                  ]}
+                />
               </div>
-            )}
-            <div className="flex gap-2">
-              <input
-                value={newTag}
-                onChange={(e) => setNewTag(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void handleAddTag();
-                  }
-                }}
-                placeholder="New tag name"
-                className="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
+              {uaMode === "custom" && (
+                <div className="col-span-2">
+                  <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">Custom user agent</label>
+                  <textarea
+                    value={customUserAgent}
+                    onChange={(e) => setCustomUserAgent(e.target.value)}
+                    rows={3}
+                    placeholder="Paste the full User-Agent string"
+                    className="w-full resize-none rounded-lg border border-neutral-300 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
+                  />
+                </div>
+              )}
+              <FpField
+                label="Screen (WIDTHxHEIGHT)"
+                placeholder="412x915"
+                value={screenText}
+                onChange={setScreenText}
+                className="col-span-2"
               />
-              <button
-                type="button"
-                onClick={handleAddTag}
-                disabled={addingTag || !newTag.trim()}
-                title="Create tag"
-                className="flex shrink-0 items-center rounded-lg border border-neutral-300 px-3 text-neutral-600 hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
-              >
-                {addingTag ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              </button>
+              <FpNumberField label="Latitude" placeholder="52.52" value={geoLat} onChange={setGeoLat} />
+              <FpNumberField label="Longitude" placeholder="13.405" value={geoLon} onChange={setGeoLon} />
+              <FpField
+                label="System fonts (comma-separated)"
+                placeholder="Arial, Calibri, Segoe UI"
+                value={fontsText}
+                onChange={setFontsText}
+                className="col-span-2"
+              />
+              <label className="col-span-2 flex items-start gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
+                <input
+                  type="checkbox"
+                  checked={disableWebRTC}
+                  onChange={(e) => setDisableWebRTC(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 accent-blue-600"
+                />
+                <span>
+                  Disable WebRTC
+                  <span className="mt-0.5 block font-normal text-neutral-400 dark:text-neutral-500">
+                    Stops sites from learning your real IP through WebRTC (common
+                    proxy leak). Video and voice calls will not work in this profile.
+                  </span>
+                </span>
+              </label>
             </div>
-          </div>
+          </details>
 
           <div>
             <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">
-              Extra launch arguments (optional)
+              Startup page (optional)
             </label>
             <input
-              value={extraArgs}
-              onChange={(e) => setExtraArgs(e.target.value)}
-              placeholder="--disable-gpu --start-maximized https://example.com"
-              className="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
+              value={startupUrl}
+              onChange={(e) => setStartupUrl(e.target.value)}
+              placeholder="https://example.com"
+              className="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
             />
             <p className="mt-1 text-xs text-neutral-400 dark:text-neutral-500">
-              Appended to the browser command line. Flags managed by MBM
-              (--user-data-dir, --proxy-server, --load-extension, --class) are
-              rejected.
+              Opened when the browser starts. Only http:// and https:// addresses.
             </p>
-          </div>
-
-          <div className="grid grid-cols-2 items-end gap-3">
-            <label className="flex items-center gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
-              <input
-                type="checkbox"
-                checked={restartOnCrash}
-                onChange={(e) => setRestartOnCrash(e.target.checked)}
-                className="h-4 w-4 accent-blue-600"
-              />
-              Auto-restart on crash
-            </label>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">
-                Stop timeout (s)
-              </label>
-              <input
-                type="number"
-                min={1}
-                max={60}
-                value={stopTimeoutSecs}
-                onChange={(e) => setStopTimeoutSecs(e.target.value === "" ? "" : Number(e.target.value))}
-                placeholder="3"
-                className="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
-              />
-            </div>
           </div>
 
           <div>
@@ -333,6 +365,58 @@ export function ProfileForm({ profile, proxies, groups, folders, defaultFolderId
           </div>
         </form>
       </div>
+    </div>
+  );
+}
+
+function FpField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  className = "",
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  className?: string;
+}) {
+  return (
+    <div className={className}>
+      <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">{label}</label>
+      <input
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
+      />
+    </div>
+  );
+}
+
+function FpNumberField({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: number | "";
+  onChange: (v: number | "") => void;
+  placeholder?: string;
+}) {
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-neutral-500 dark:text-neutral-400">{label}</label>
+      <input
+        type="number"
+        step="any"
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value === "" ? "" : Number(e.target.value))}
+        className="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-600 dark:border-neutral-800 dark:bg-neutral-950"
+      />
     </div>
   );
 }

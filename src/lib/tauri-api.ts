@@ -7,7 +7,6 @@ import type {
   CreateProxyInput,
   Credential,
   DeletedProfileInfo,
-  Group,
   ImportResult,
   LaunchResult,
   Folder,
@@ -19,7 +18,6 @@ import type {
   UpdateProfileInput,
   UpdateProxyInput,
   UsageStat,
-  WindowRule,
 } from "../types";
 
 // Profile
@@ -38,12 +36,6 @@ export const emptyTrash = () => invoke<number>("empty_trash");
 export const duplicateProfile = (id: string) =>
   invoke<Profile>("duplicate_profile", { id });
 export const togglePin = (id: string) => invoke<boolean>("toggle_pin", { id });
-
-// Groups / tags
-export const getGroups = () => invoke<Group[]>("get_groups");
-export const createGroup = (name: string) => invoke<Group>("create_group", { name });
-export const setProfileGroups = (profileId: string, groupIds: string[]) =>
-  invoke<void>("set_profile_groups", { profileId, groupIds });
 
 // Folders (file-manager style organization)
 export const getFolders = () => invoke<Folder[]>("get_folders");
@@ -100,9 +92,6 @@ export const getSettings = () => invoke<AppSettings>("get_settings");
 export const updateSettings = (settings: AppSettings) =>
   invoke<AppSettings>("update_settings", { settings });
 export const getBackupDir = () => invoke<string>("get_backup_dir");
-
-// Window rules / workspaces
-export const getWindowRules = () => invoke<WindowRule[]>("get_window_rules");
 
 // Credentials (per-profile accounts; secrets live in the OS keychain)
 export const getCredentials = (profileId: string) =>

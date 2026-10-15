@@ -1,7 +1,6 @@
 pub mod backup;
 pub mod credentials;
 pub mod folders;
-pub mod groups;
 pub mod process;
 pub mod profile;
 pub mod proxy;

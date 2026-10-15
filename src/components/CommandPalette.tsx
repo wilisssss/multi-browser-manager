@@ -8,7 +8,7 @@ export interface PaletteCommand {
   section: string;
   /** Right-side hint, e.g. a keyboard shortcut or profile status. */
   hint?: string;
-  /** Extra searchable text (notes, tags, browser type). */
+  /** Extra searchable text (notes, browser type). */
   keywords?: string;
   icon: LucideIcon;
   action: () => void;

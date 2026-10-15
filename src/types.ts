@@ -1,9 +1,3 @@
-export interface Group {
-  id: string;
-  name: string;
-  color: string | null;
-}
-
 export interface Profile {
   id: string;
   name: string;
@@ -16,15 +10,39 @@ export interface Profile {
   updatedAt: number;
   lastUsedAt: number | null;
   pinned: boolean;
-  /** Extra launch args, space-separated with double-quote support. */
-  extraArgs: string | null;
   /** Re-launch automatically after an unexpected exit. */
   restartOnCrash: boolean;
-  /** Graceful-stop window in seconds; null = 3 s default. */
-  stopTimeoutSecs: number | null;
   /** Folder this profile lives in; null = unfiled (root's pseudo-view). */
   folderId: string | null;
-  groups: Group[];
+  /** Identity overrides; null = browser defaults. */
+  fingerprint: Fingerprint | null;
+  /** Page opened when the browser starts; null = browser default. */
+  startupUrl: string | null;
+}
+
+/** Per-profile identity overrides. Unset fields keep the browser's value. */
+export interface Fingerprint {
+  language?: string | null;
+  userAgent?: string | null;
+  timezone?: string | null;
+  platform?: string | null;
+  geolocation?: Geolocation | null;
+  fonts?: string[] | null;
+  screen?: Screen | null;
+  /** Block WebRTC from revealing the host IP. Calls will not connect. */
+  disableWebRTC?: boolean;
+}
+
+/** Reported screen size in CSS pixels. */
+export interface Screen {
+  width: number;
+  height: number;
+}
+
+export interface Geolocation {
+  latitude: number;
+  longitude: number;
+  accuracy?: number;
 }
 
 export interface CreateProfileInput {
@@ -32,10 +50,10 @@ export interface CreateProfileInput {
   browserType: string;
   proxyId: string | null;
   notes: string | null;
-  extraArgs?: string | null;
   restartOnCrash?: boolean;
-  stopTimeoutSecs?: number | null;
   folderId?: string | null;
+  fingerprint?: Fingerprint | null;
+  startupUrl?: string | null;
 }
 
 export interface UpdateProfileInput {
@@ -43,10 +61,10 @@ export interface UpdateProfileInput {
   browserType?: string;
   proxyId?: string | null;
   notes?: string | null;
-  extraArgs?: string | null;
   restartOnCrash?: boolean;
-  stopTimeoutSecs?: number | null;
   folderId?: string | null;
+  fingerprint?: Fingerprint | null;
+  startupUrl?: string | null;
 }
 
 /** A user-created folder grouping profiles (file-manager style, nestable). */
@@ -147,17 +165,8 @@ export interface AppSettings {
   autoBackup: boolean;
   autoBackupKeep: number;
   defaultBrowserType: string;
-  groupWorkspaces: Record<string, number>;
   /** Memory-trim launch mode: append curated RAM-saving flags. */
   lightweightBrowsers: boolean;
-}
-
-export interface WindowRule {
-  profileId: string;
-  profileName: string;
-  appId: string;
-  status: string;
-  groupIds: string[];
 }
 
 export interface Credential {

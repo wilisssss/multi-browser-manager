@@ -7,6 +7,7 @@ use crate::AppState;
 use rusqlite::params;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,7 +24,7 @@ pub struct LaunchResult {
 /// control channel into that watcher plus an exit signal. Stop therefore
 /// flows through the process that owns the handle:
 ///   1. `stop_tx` → watcher sends the graceful stop (SIGTERM / taskkill),
-///   2. waits up to the profile's grace period,
+///   2. waits up to the grace period,
 ///   3. escalates via `Child::start_kill()` — cross-platform, in-process,
 ///      no `kill -9` / `taskkill /F` subprocess parsing.
 /// `done_rx` lets `do_stop` await the actual exit without polling /proc.
@@ -34,8 +35,8 @@ pub struct RunningProc {
     done_rx: watch::Receiver<bool>,
 }
 
-/// Default graceful-stop window when the profile doesn't set one.
-const DEFAULT_STOP_TIMEOUT_SECS: i64 = 3;
+/// Graceful-stop window before the browser is force-killed.
+const STOP_TIMEOUT_SECS: u64 = 3;
 /// Max automatic restarts per launch session (crash-recovery policy).
 const MAX_CRASH_RESTARTS: u32 = 3;
 
@@ -75,26 +76,64 @@ fn build_launch_spec_blocking(
     proxy_row: Option<(String, String, i64, Option<String>)>,
     trim_memory: bool,
 ) -> AppResult<launcher::LaunchSpec> {
-    let (proxy_server, extension_path) = match proxy_row {
+    let mut extension_paths: Vec<String> = Vec::new();
+    let mut proxy_timezone: Option<String> = None;
+    let proxy_server_set = proxy_row.is_some();
+    let (proxy_server, proxy_extension) = match proxy_row {
         None => (None, None),
         Some((protocol, host, port, username)) => {
             proxy_manager::ensure_valid_protocol(&protocol)?;
-            match username.filter(|u| !u.is_empty()) {
+            let username = username.filter(|u| !u.is_empty());
+            let password = match &username {
+                Some(_) => Some(proxy_manager::get_proxy_password(profile.proxy_id.as_deref().unwrap_or(""))?),
+                None => None,
+            };
+            // Only needed when the profile does not set its own timezone.
+            let needs_tz = profile.fingerprint.as_ref().and_then(|f| f.timezone.as_ref()).is_none();
+            if needs_tz {
+                proxy_timezone = proxy_manager::lookup_timezone_via_proxy(
+                    &protocol,
+                    &host,
+                    port,
+                    username.as_deref(),
+                    password.as_deref(),
+                );
+            }
+            match username {
                 Some(username) => {
-                    let password = proxy_manager::get_proxy_password(profile.proxy_id.as_deref().unwrap_or(""))?;
                     let ext = proxy_manager::generate_auth_proxy_extension(
-                        &profile.id, &protocol, &host, port, &username, &password,
+                        &profile.id,
+                        &protocol,
+                        &host,
+                        port,
+                        &username,
+                        password.as_deref().unwrap_or(""),
                     )?;
                     (None, Some(ext.to_string_lossy().to_string()))
                 }
-                None => (
-                    Some(format!("{protocol}://{host}:{port}")),
-                    None,
-                ),
+                None => (Some(format!("{protocol}://{host}:{port}")), None),
             }
         }
     };
+    extension_paths.extend(proxy_extension);
 
+    let mut fingerprint = profile.fingerprint.clone().unwrap_or_default();
+    // Timezone: an explicit profile setting wins; otherwise a proxied profile
+    // reports the zone of its exit IP.
+    if fingerprint.timezone.is_none() {
+        if let Some(tz) = proxy_timezone.as_deref() {
+            fingerprint.timezone = Some(tz.to_string());
+        }
+    }
+    // Phone UA: viewport and screen follow the device (portrait).
+    let phone = profile
+        .fingerprint
+        .as_ref()
+        .and_then(|f| f.user_agent.as_deref())
+        .and_then(crate::browser::user_agent::phone_screen_for_ua);
+    if let Some((w, h)) = phone {
+        fingerprint.screen = Some(crate::models::profile::Screen { width: w, height: h });
+    }
     let executable_path = detect_executable_for(state, &profile.browser_type)
         .ok_or_else(|| {
             AppError::not_found(format!(
@@ -119,18 +158,56 @@ fn build_launch_spec_blocking(
         let _ = std::fs::remove_file(user_dir.join("SingletonLock"));
     }
 
-    // Per-profile extra arguments (feature 1), validated at save time and
-    // re-validated here so a hand-edited DB cannot inject blocked flags.
-    let extra_args = launcher::validate_extra_args(profile.extra_args.as_deref().unwrap_or(""))?;
-
     Ok(launcher::LaunchSpec {
         executable_path,
         user_data_dir: profile.user_data_dir.clone(),
         proxy_server,
-        extension_path,
-        window_class: Some(launcher::window_app_id(&profile.id, &profile.name)),
-        extra_args,
+        extension_paths,
         trim_memory,
+        language: fingerprint.language.clone(),
+        user_agent: fingerprint.user_agent.clone(),
+        startup_url: profile.startup_url.clone(),
+        window_size: phone,
+        disable_webrtc: fingerprint.disable_webrtc,
+        webrtc_proxy_only: proxy_server_set,
+        env: fingerprint
+            .timezone
+            .as_ref()
+            .map(|tz| vec![("TZ".to_string(), tz.clone())])
+            .unwrap_or_default(),
+        debug_port: Some(crate::browser::cdp::pick_debug_port()?),
+    })
+}
+
+/// Identity applied over CDP once the browser is up. Mirrors the launch
+/// flags so the page sees the same profile everywhere.
+fn cdp_plan(profile: &Profile, spec: &launcher::LaunchSpec) -> AppResult<crate::browser::cdp::Plan> {
+    use crate::browser::cdp::{ClientHints, Plan};
+    let fp = profile.fingerprint.clone().unwrap_or_default();
+    let phone = spec.window_size;
+    let client_hints = fp.user_agent.as_deref().map(|ua| {
+        let id = crate::browser::fingerprint::UaIdentity::from_ua(ua);
+        ClientHints {
+            platform: id.ua_platform.to_string(),
+            platform_version: id.platform_version,
+            architecture: id.architecture.to_string(),
+            model: id.model,
+            mobile: id.mobile,
+            full_version: id.full_version,
+        }
+    });
+    let init_script = crate::browser::fingerprint::script_with_seed(
+        &fp,
+        crate::browser::fingerprint::profile_seed(&profile.id),
+    )?;
+    Ok(Plan {
+        init_script: Some(init_script),
+        user_agent: spec.user_agent.clone(),
+        client_hints,
+        viewport: phone,
+        mobile: phone.is_some(),
+        timezone: spec.env.iter().find(|(k, _)| k == "TZ").map(|(_, v)| v.clone()),
+        locale: fp.language.clone(),
     })
 }
 
@@ -187,11 +264,33 @@ async fn do_launch_inner(
     restart_attempt: u32,
 ) -> LaunchResult {
     let state = app.state::<AppState>();
-
     // Serialize launch/stop per profile: two concurrent triggers (tray click +
     // `mbm --launch` via single-instance) must not both pass the status check
-    // and double-spawn. The guard is held for the whole operation.
-    let _action_guard = acquire_profile_action_lock(&state, &profile_id).await;
+    // and double-spawn.
+    let result = {
+        let _action_guard = acquire_profile_action_lock(&state, &profile_id).await;
+        launch_locked(&app, profile_id.clone(), restart_attempt).await
+    };
+    release_profile_action_lock(&state, &profile_id);
+    result
+}
+
+async fn launch_locked(
+    app: &AppHandle,
+    profile_id: String,
+    restart_attempt: u32,
+) -> LaunchResult {
+    let state = app.state::<AppState>();
+
+    // The registry is the source of truth for live processes; the DB `status`
+    // can lag (crash, missed exit event) and must not block a relaunch.
+    if state.running.lock().await.contains_key(&profile_id) {
+        return LaunchResult {
+            profile_id,
+            success: false,
+            message: "Profile is already running".into(),
+        };
+    }
 
     // 1) Fast DB part — never holds the lock across slow work.
     let (profile, proxy_row, trim_memory) = {
@@ -244,6 +343,11 @@ async fn do_launch_inner(
         }
     };
 
+    let plan = match cdp_plan(&profile, &spec) {
+        Ok(plan) => plan,
+        Err(e) => return LaunchResult { profile_id, success: false, message: e.to_string() },
+    };
+
     launcher::ensure_user_data_dir(std::path::Path::new(&profile.user_data_dir)).ok();
 
     let child = match launcher::spawn(&spec) {
@@ -259,39 +363,46 @@ async fn do_launch_inner(
 
     let pid = child.id().unwrap_or(0);
 
+    // Identity over CDP: wait for the page, then apply viewport, UA, timezone
+    // and the fingerprint script. Runs in the background so launch returns
+    // immediately; failures are logged, not fatal.
+    if let Some(port) = spec.debug_port {
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = crate::browser::cdp::apply(port, &plan).await {
+                eprintln!("mbm: CDP identity for profile failed: {e}");
+            }
+        });
+    }
+
     // Register before any bookkeeping so a fast exit is still stoppable and
     // status queries see it.
     let (stop_tx, stop_rx) = mpsc::unbounded_channel();
     let (done_tx, done_rx) = watch::channel(false);
     state.running.lock().await.insert(
         profile_id.clone(),
-        RunningProc { pid, stop_tx, done_rx },
+        RunningProc { pid, stop_tx: stop_tx.clone(), done_rx },
     );
 
     let now = chrono::Utc::now().timestamp();
-    {
-        let conn = db_lock(&state).ok();
-        if let Some(conn) = conn {
-            if let Err(e) = conn.execute(
+    let db_result: AppResult<()> = match db_lock(&state) {
+        Ok(conn) => conn
+            .execute(
                 "UPDATE profiles SET status = 'running', last_used_at = ?1 WHERE id = ?2",
                 params![now, profile_id],
-            ) {
-                eprintln!("mbm: failed to mark profile running: {e}");
-            }
-            if let Err(e) = conn.execute(
-                "INSERT INTO launch_history (profile_id, launched_at, pid) VALUES (?1, ?2, ?3)",
-                params![profile_id, now, pid],
-            ) {
-                eprintln!("mbm: failed to record launch history: {e}");
-            }
-        }
-    }
-
-    // Notify UI + tray (covers programmatic/CLI launches too).
-    crate::sync::after_profile_change(&app, &profile_id);
-
-    // Background supervisor: owns the child, detects exit instantly, handles
-    // stop requests and the crash-restart policy (feature 4).
+            )
+            .and_then(|_| {
+                conn.execute(
+                    "INSERT INTO launch_history (profile_id, launched_at, pid) VALUES (?1, ?2, ?3)",
+                    params![profile_id, now, pid],
+                )
+            })
+            .map(|_| ())
+            .map_err(AppError::from),
+        Err(e) => Err(e),
+    };
+    // The supervisor must run in every case: it owns the child process. If the
+    // status write failed, we ask it to stop the browser we just started (so
+    // nothing is left running untracked) instead of returning and orphaning it.
     let watcher_app = app.clone();
     let watcher_id = profile_id.clone();
     let watcher_profile = profile;
@@ -302,9 +413,17 @@ async fn do_launch_inner(
         stop_rx,
         done_tx,
         watcher_profile.restart_on_crash,
-        watcher_profile.stop_timeout_secs,
         restart_attempt,
     ));
+
+    if let Err(e) = db_result {
+        eprintln!("mbm: failed to record launch for {profile_id}: {e}");
+        let _ = stop_tx.send(());
+        return LaunchResult { profile_id, success: false, message: e.to_string() };
+    }
+
+    // Notify UI + tray (covers programmatic/CLI launches too).
+    crate::sync::after_profile_change(&app, &profile_id);
 
     LaunchResult {
         profile_id,
@@ -317,8 +436,8 @@ async fn do_launch_inner(
 ///
 /// Exit paths:
 /// - the process exits on its own (clean or crashed),
-/// - a stop request arrives → graceful stop (profile's `stop_timeout_secs`,
-///   default 3 s) → escalate via `Child::start_kill()`.
+/// - a stop request arrives → graceful stop (`STOP_TIMEOUT_SECS`) → escalate
+///   via `Child::start_kill()`.
 ///
 /// After exit: registry cleanup, DB status/history bookkeeping, extension
 /// sweep, `profile-stopped` event — and, when the profile opted into the
@@ -332,7 +451,6 @@ async fn supervise(
     mut stop_rx: mpsc::UnboundedReceiver<()>,
     done_tx: watch::Sender<bool>,
     restart_on_crash: bool,
-    stop_timeout_secs: Option<i64>,
     restart_attempt: u32,
 ) {
     let state = app.state::<AppState>();
@@ -347,11 +465,7 @@ async fn supervise(
                 // request (Windows) lets Chromium flush session data; a hard
                 // kill causes the "Restore pages?" bubble on next launch.
                 send_signal(child.id().unwrap_or(0), "TERM").await;
-                let grace = std::time::Duration::from_secs(
-                    stop_timeout_secs
-                        .unwrap_or(DEFAULT_STOP_TIMEOUT_SECS)
-                        .clamp(1, 60) as u64,
-                );
+                let grace = std::time::Duration::from_secs(STOP_TIMEOUT_SECS);
                 match tokio::time::timeout(grace, child.wait()).await {
                     Ok(result) => break result,
                     Err(_) => {
@@ -443,6 +557,21 @@ async fn acquire_profile_action_lock(
     lock.lock_owned().await
 }
 
+/// Drops a profile's operation lock entry once nobody else holds or waits on
+/// it, so `profile_locks` does not grow with every profile ever touched.
+fn release_profile_action_lock(state: &AppState, profile_id: &str) {
+    let mut locks = state
+        .profile_locks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(lock) = locks.get(profile_id) {
+        // strong_count == 1 means only the map holds it: no guard, no waiter.
+        if Arc::strong_count(lock) == 1 {
+            locks.remove(profile_id);
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn launch_profile(app: AppHandle, id: String) -> AppResult<LaunchResult> {
     let result = do_launch(app, id).await;
@@ -459,7 +588,17 @@ pub async fn do_stop(app: AppHandle, id: String) -> AppResult<()> {
 
     // Same per-profile lock as do_launch: a stop racing an in-flight launch
     // must not kill a freshly spawned browser or converge status wrongly.
-    let _action_guard = acquire_profile_action_lock(&state, &id).await;
+    let result = {
+        let _action_guard = acquire_profile_action_lock(&state, &id).await;
+        stop_locked(&app, &id).await
+    };
+    release_profile_action_lock(&state, &id);
+    result
+}
+
+async fn stop_locked(app: &AppHandle, id: &str) -> AppResult<()> {
+    let state = app.state::<AppState>();
+    let id = id.to_string();
 
     // Tracked path (architecture A1): tell the supervisor to stop, then await
     // the exit signal. The supervisor performs graceful stop + escalation

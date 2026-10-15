@@ -3,7 +3,6 @@ use crate::error::{AppError, AppResult};
 use crate::AppState;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tauri::State;
 
 /// Key under which the whole settings JSON blob is stored.
@@ -24,9 +23,6 @@ pub struct Settings {
     pub auto_backup_keep: i64,
     /// Preselected browser type when creating a new profile.
     pub default_browser_type: String,
-    /// Tag (group) id -> niri workspace number, used by the window-rules
-    /// generator: profiles carrying the tag open on that workspace.
-    pub group_workspaces: HashMap<String, i64>,
     /// Launch browsers in memory-trim ("lightweight") mode: append curated
     /// RAM-saving flags (process-per-site, no media router/translate/sync
     /// services, ...). Default on — farm/kiosk profiles rarely want them.
@@ -51,7 +47,6 @@ impl Default for Settings {
             auto_backup: true,
             auto_backup_keep: 10,
             default_browser_type: "chromium".into(),
-            group_workspaces: HashMap::new(),
             lightweight_browsers: true,
         }
     }
@@ -95,13 +90,6 @@ fn validate(settings: &Settings) -> AppResult<()> {
             "Snapshots to keep must be between 1 and 100",
         ));
     }
-    for ws in settings.group_workspaces.values() {
-        if !(1..=100).contains(ws) {
-            return Err(AppError::validation(
-                "Workspace numbers must be between 1 and 100",
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -117,40 +105,6 @@ pub fn update_settings(state: State<'_, AppState>, settings: Settings) -> AppRes
     let conn = db_lock(&state)?;
     save_settings(&conn, &settings)?;
     Ok(settings)
-}
-
-// ---- Window rules / workspaces (moved from commands/window_rules.rs — A6:
-// one "display preferences" domain, one module) ----
-
-use crate::browser::launcher;
-
-/// Per-profile window identity: every browser is launched with a unique
-/// `--class` / `--wayland-app-id` so compositors (niri, etc.) can attach
-/// window rules per profile, and workspaces can be assigned per tag.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WindowRule {
-    pub profile_id: String,
-    pub profile_name: String,
-    pub app_id: String,
-    pub status: String,
-    pub group_ids: Vec<String>,
-}
-
-#[tauri::command]
-pub fn get_window_rules(state: State<'_, AppState>) -> AppResult<Vec<WindowRule>> {
-    let conn = db_lock(&state)?;
-    let profiles = crate::commands::profile::list_profiles(&conn)?;
-    Ok(profiles
-        .into_iter()
-        .map(|p| WindowRule {
-            app_id: launcher::window_app_id(&p.id, &p.name),
-            profile_id: p.id,
-            profile_name: p.name,
-            status: p.status,
-            group_ids: p.groups.iter().map(|g| g.id.clone()).collect(),
-        })
-        .collect())
 }
 
 #[cfg(test)]
@@ -173,12 +127,10 @@ mod tests {
         let mut s2 = s.clone();
         s2.history_retention_days = 30;
         s2.auto_backup = false;
-        s2.group_workspaces.insert("gid-1".into(), 2);
         save_settings(&conn, &s2).unwrap();
         let s3 = load_settings(&conn);
         assert_eq!(s3.history_retention_days, 30);
         assert!(!s3.auto_backup);
-        assert_eq!(s3.group_workspaces.get("gid-1"), Some(&2));
 
         // A row missing newer fields backfills from defaults.
         conn.execute(
@@ -200,9 +152,6 @@ mod tests {
         let s = Settings { history_retention_days: 0, ..Default::default() };
         assert!(validate(&s).is_err());
         let s = Settings { auto_backup_keep: 0, ..Default::default() };
-        assert!(validate(&s).is_err());
-        let mut s = Settings::default();
-        s.group_workspaces.insert("g".into(), 0);
         assert!(validate(&s).is_err());
         assert!(validate(&Settings::default()).is_ok());
     }

@@ -32,25 +32,22 @@ function loadSort(): SortKey {
 
 interface Filters {
   profiles: Profile[];
-  /** Valid tag ids, for the stale-filter fallback (L10). */
-  groups?: { id: string }[];
   /** Total browser seconds per profile id (from launch-history stats). */
   usageSeconds?: Record<string, number>;
 }
 
 /**
- * Search (debounced), status/browser/tag filters and sorting for the profile
+ * Search (debounced), status/browser filters and sorting for the profile
  * grid, plus the debounced search state. Extracted from Dashboard so the
  * filtering rules are one cohesive, testable unit.
  */
-export function useProfileFilters({ profiles, groups, usageSeconds }: Filters) {
+export function useProfileFilters({ profiles, usageSeconds }: Filters) {
   const [search, setSearch] = useState("");
   // Debounced mirror of `search`: typing filters after a short pause instead of
   // re-filtering (and re-rendering every card) on each keystroke.
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "running" | "stopped">("all");
   const [browserFilter, setBrowserFilter] = useState<string>("all");
-  const [tagFilter, setTagFilter] = useState<string>("all");
   const [sortBy, setSortBy] = useState<SortKey>(loadSort);
   const searchRef = useRef<HTMLInputElement>(null);
 
@@ -78,7 +75,6 @@ export function useProfileFilters({ profiles, groups, usageSeconds }: Filters) {
       }
       if (statusFilter !== "all" && p.status !== statusFilter) return false;
       if (browserFilter !== "all" && p.browserType !== browserFilter) return false;
-      if (tagFilter !== "all" && !p.groups.some((g) => g.id === tagFilter)) return false;
       return true;
     });
 
@@ -119,7 +115,7 @@ export function useProfileFilters({ profiles, groups, usageSeconds }: Filters) {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       return cmp(a, b);
     });
-  }, [profiles, debouncedSearch, statusFilter, browserFilter, tagFilter, sortBy, usageSeconds]);
+  }, [profiles, debouncedSearch, statusFilter, browserFilter, sortBy, usageSeconds]);
 
   // L10: a stored filter value can become stale (browser uninstalled, tag
   // deleted) — fall back to "all" instead of showing a raw value with no
@@ -130,12 +126,6 @@ export function useProfileFilters({ profiles, groups, usageSeconds }: Filters) {
     }
   }, [browserTypes, browserFilter]);
 
-  useEffect(() => {
-    if (tagFilter !== "all" && groups && !groups.some((g) => g.id === tagFilter)) {
-      setTagFilter("all");
-    }
-  }, [groups, tagFilter]);
-
   return {
     search,
     setSearch,
@@ -143,8 +133,6 @@ export function useProfileFilters({ profiles, groups, usageSeconds }: Filters) {
     setStatusFilter,
     browserFilter,
     setBrowserFilter,
-    tagFilter,
-    setTagFilter,
     sortBy,
     setSortBy,
     browserTypes,

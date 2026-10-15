@@ -116,24 +116,6 @@ export const ProfileCard = memo(function ProfileCard({
         />
       </div>
 
-      {/* Tags */}
-      {profile.groups.length > 0 && (
-        <div className="mb-3 flex flex-wrap gap-1.5">
-          {profile.groups.map((g) => {
-            const color = g.color ?? "#3b82f6";
-            return (
-              <span
-                key={g.id}
-                className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs"
-                style={{ backgroundColor: `${color}22`, color }}
-              >
-                {g.name}
-              </span>
-            );
-          })}
-        </div>
-      )}
-
       {/* Proxy badge */}
       {proxy && (
         <div className="mb-3 inline-flex max-w-full items-center gap-1.5 self-start rounded-md bg-neutral-100 px-2.5 py-1.5 text-xs text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300">

@@ -1,10 +1,8 @@
 use crate::browser::{detector, launcher};
 use crate::error::{AppError, AppResult};
-use crate::models::group::Group;
-use crate::models::profile::{CreateProfileInput, Profile, UpdateProfileInput};
+use crate::models::profile::{CreateProfileInput, Fingerprint, Profile, UpdateProfileInput};
 use crate::AppState;
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
 use tauri::{AppHandle, State};
 
 fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<Profile> {
@@ -20,42 +18,91 @@ fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<Profile> {
         updated_at: row.get("updated_at")?,
         last_used_at: row.get("last_used_at")?,
         pinned: row.get::<_, i64>("pinned")? != 0,
-        extra_args: row.get("extra_args")?,
         restart_on_crash: row.get::<_, i64>("restart_on_crash")? != 0,
-        stop_timeout_secs: row.get("stop_timeout_secs")?,
         folder_id: row.get("folder_id")?,
-        groups: Vec::new(),
+        fingerprint: decode_fingerprint(row.get("fingerprint")?),
+        startup_url: row.get("startup_url")?,
     })
 }
 
-/// Attaches group tags to each profile in the list (single extra query).
-fn attach_groups(conn: &Connection, profiles: &mut [Profile]) -> AppResult<()> {
-    let mut stmt = conn.prepare(
-        "SELECT pg.profile_id, g.id, g.name, g.color
-         FROM profile_groups pg JOIN groups g ON g.id = pg.group_id
-         ORDER BY g.name COLLATE NOCASE ASC",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                Group {
-                    id: r.get(1)?,
-                    name: r.get(2)?,
-                    color: r.get(3)?,
-                },
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Index by profile id once — O(P + G) instead of O(P × G).
-    let mut by_profile: HashMap<String, Vec<Group>> = HashMap::new();
-    for (profile_id, group) in rows {
-        by_profile.entry(profile_id).or_default().push(group);
+/// Normalizes a startup URL: blank = none. Only `http`/`https` are accepted,
+/// so a profile cannot be pointed at `file:`, `chrome:` or script-like schemes.
+fn validate_startup_url(url: Option<&str>) -> AppResult<Option<String>> {
+    let Some(raw) = url.map(str::trim).filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+    if raw.len() > 2048 || raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(AppError::validation("Startup URL is too long or contains spaces"));
     }
-    for p in profiles.iter_mut() {
-        if let Some(groups) = by_profile.remove(&p.id) {
-            p.groups = groups;
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| AppError::validation("Startup URL must be a valid http:// or https:// address"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(AppError::validation("Startup URL must start with http:// or https://"));
+    }
+    Ok(Some(raw.to_string()))
+}
+
+/// Stored fingerprint JSON → struct. A corrupt value is ignored (treated as
+/// "no overrides") instead of making the whole profile unreadable.
+fn decode_fingerprint(raw: Option<String>) -> Option<Fingerprint> {
+    raw.and_then(|json| serde_json::from_str::<Fingerprint>(&json).ok())
+        .filter(|fp| !fp.is_empty())
+}
+
+/// Struct → stored JSON. An empty fingerprint is stored as NULL.
+fn encode_fingerprint(fp: &Option<Fingerprint>) -> AppResult<Option<String>> {
+    match fp {
+        Some(f) if !f.is_empty() => Ok(Some(serde_json::to_string(f)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Rejects values that would produce broken flags or script in the launch.
+fn validate_fingerprint(fp: Option<&Fingerprint>) -> AppResult<()> {
+    let Some(fp) = fp else { return Ok(()) };
+    let bad = |field: &str| AppError::validation(format!("Invalid fingerprint {field}"));
+    if let Some(lang) = &fp.language {
+        if lang.is_empty()
+            || lang.len() > 35
+            || !lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(bad("language (expected a BCP-47 tag like en-US)"));
+        }
+    }
+    if let Some(ua) = &fp.user_agent {
+        if ua.len() > 512 || ua.chars().any(|c| c.is_control()) {
+            return Err(bad("user agent"));
+        }
+    }
+    if let Some(tz) = &fp.timezone {
+        if tz.is_empty()
+            || tz.len() > 64
+            || !tz.chars().all(|c| c.is_ascii_alphanumeric() || "/_+-".contains(c))
+        {
+            return Err(bad("timezone (expected an IANA name like Europe/Berlin)"));
+        }
+    }
+    if let Some(p) = &fp.platform {
+        if p.len() > 64 || p.chars().any(|c| c.is_control()) {
+            return Err(bad("platform"));
+        }
+    }
+    if let Some(g) = &fp.geolocation {
+        if !(-90.0..=90.0).contains(&g.latitude)
+            || !(-180.0..=180.0).contains(&g.longitude)
+            || !(1.0..=100_000.0).contains(&g.accuracy)
+        {
+            return Err(bad("geolocation (latitude −90..90, longitude −180..180)"));
+        }
+    }
+    if let Some(s) = &fp.screen {
+        if !(100..=10_000).contains(&s.width) || !(100..=10_000).contains(&s.height) {
+            return Err(bad("screen size (each side 100..10000 px)"));
+        }
+    }
+    if let Some(fonts) = &fp.fonts {
+        if fonts.len() > 500 || fonts.iter().any(|f| f.is_empty() || f.len() > 100 || f.chars().any(|c| c.is_control())) {
+            return Err(bad("fonts"));
         }
     }
     Ok(())
@@ -64,10 +111,9 @@ fn attach_groups(conn: &Connection, profiles: &mut [Profile]) -> AppResult<()> {
 pub fn list_profiles(conn: &Connection) -> AppResult<Vec<Profile>> {
     let mut stmt =
         conn.prepare("SELECT * FROM profiles ORDER BY pinned DESC, name COLLATE NOCASE ASC")?;
-    let mut profiles = stmt
+    let profiles = stmt
         .query_map([], row_to_profile)?
         .collect::<Result<Vec<_>, _>>()?;
-    attach_groups(conn, &mut profiles)?;
     Ok(profiles)
 }
 
@@ -105,34 +151,20 @@ fn validate_name(conn: &Connection, name: &str, exclude_id: Option<&str>) -> App
 }
 
 /// Validates fields shared by create and update (audit L6): browser_type must
-/// be one this build can actually detect/launch, and extra args must parse
-/// and not override MBM's own flags.
-fn validate_launch_fields(browser_type: &str, extra_args: Option<&str>) -> AppResult<()> {
+/// be one this build can actually detect/launch.
+fn validate_launch_fields(browser_type: &str) -> AppResult<()> {
     if !detector::is_known_browser_type(browser_type) {
         return Err(AppError::validation(format!(
             "Unknown browser type '{browser_type}'. Supported: {}",
             detector::known_browser_types().join(", ")
         )));
     }
-    launcher::validate_extra_args(extra_args.unwrap_or(""))?;
-    Ok(())
-}
-
-/// Validates a per-profile stop timeout if present (1..=60 seconds).
-fn validate_stop_timeout(secs: Option<i64>) -> AppResult<()> {
-    if let Some(s) = secs {
-        if !(1..=60).contains(&s) {
-            return Err(AppError::validation(
-                "Stop timeout must be between 1 and 60 seconds",
-            ));
-        }
-    }
     Ok(())
 }
 
 pub fn insert_profile(conn: &Connection, profile: &Profile) -> AppResult<()> {
     conn.execute(
-        "INSERT INTO profiles (id, name, browser_type, user_data_dir, proxy_id, notes, status, created_at, updated_at, last_used_at, pinned, extra_args, restart_on_crash, stop_timeout_secs, folder_id)
+        "INSERT INTO profiles (id, name, browser_type, user_data_dir, proxy_id, notes, status, created_at, updated_at, last_used_at, pinned, restart_on_crash, folder_id, fingerprint, startup_url)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             profile.id,
@@ -146,10 +178,10 @@ pub fn insert_profile(conn: &Connection, profile: &Profile) -> AppResult<()> {
             profile.updated_at,
             profile.last_used_at,
             profile.pinned as i64,
-            profile.extra_args,
             profile.restart_on_crash as i64,
-            profile.stop_timeout_secs,
             profile.folder_id,
+            encode_fingerprint(&profile.fingerprint)?,
+            profile.startup_url,
         ],
     )?;
     Ok(())
@@ -169,8 +201,9 @@ pub fn create_profile(
 ) -> AppResult<Profile> {
     let conn = db_lock(&state)?;
     validate_name(&conn, &input.name, None)?;
-    validate_launch_fields(&input.browser_type, input.extra_args.as_deref())?;
-    validate_stop_timeout(input.stop_timeout_secs)?;
+    validate_launch_fields(&input.browser_type)?;
+    validate_fingerprint(input.fingerprint.as_ref())?;
+    let startup_url = validate_startup_url(input.startup_url.as_deref())?;
     if let Some(fid) = &input.folder_id {
         let exists: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM folders WHERE id = ?1",
@@ -204,11 +237,10 @@ pub fn create_profile(
         updated_at: now,
         last_used_at: None,
         pinned: false,
-        extra_args: input.extra_args,
         restart_on_crash: input.restart_on_crash,
-        stop_timeout_secs: input.stop_timeout_secs,
         folder_id: input.folder_id,
-        groups: Vec::new(),
+        fingerprint: input.fingerprint.filter(|f| !f.is_empty()),
+        startup_url,
     };
 
     insert_profile(&conn, &profile)?;
@@ -258,22 +290,22 @@ pub fn update_profile(
         Some(v) => v,
         None => existing.notes,
     };
-    let extra_args = match input.extra_args {
-        Some(v) => v,
-        None => existing.extra_args.clone(),
-    };
     let restart_on_crash = input.restart_on_crash.unwrap_or(existing.restart_on_crash);
-    let stop_timeout_secs = match input.stop_timeout_secs {
-        Some(v) => v,
-        None => existing.stop_timeout_secs,
-    };
     let folder_id = match input.folder_id {
         Some(v) => v,
         None => existing.folder_id.clone(),
     };
+    let fingerprint = match input.fingerprint {
+        Some(v) => v.filter(|f| !f.is_empty()),
+        None => existing.fingerprint.clone(),
+    };
+    let startup_url = match input.startup_url {
+        Some(v) => validate_startup_url(v.as_deref())?,
+        None => existing.startup_url.clone(),
+    };
 
-    validate_launch_fields(&browser_type, extra_args.as_deref())?;
-    validate_stop_timeout(stop_timeout_secs)?;
+    validate_launch_fields(&browser_type)?;
+    validate_fingerprint(fingerprint.as_ref())?;
     if let Some(fid) = &folder_id {
         if existing.folder_id.as_deref() != Some(fid.as_str()) {
             // Only validate when actually changing — the current value may
@@ -290,16 +322,16 @@ pub fn update_profile(
     }
 
     conn.execute(
-        "UPDATE profiles SET name = ?1, browser_type = ?2, proxy_id = ?3, notes = ?4, extra_args = ?5, restart_on_crash = ?6, stop_timeout_secs = ?7, folder_id = ?8, updated_at = ?9 WHERE id = ?10",
+        "UPDATE profiles SET name = ?1, browser_type = ?2, proxy_id = ?3, notes = ?4, restart_on_crash = ?5, folder_id = ?6, fingerprint = ?7, startup_url = ?8, updated_at = ?9 WHERE id = ?10",
         params![
             name,
             browser_type,
             proxy_id,
             notes,
-            extra_args,
             restart_on_crash as i64,
-            stop_timeout_secs,
             folder_id,
+            encode_fingerprint(&fingerprint)?,
+            startup_url,
             chrono::Utc::now().timestamp(),
             id
         ],
@@ -449,11 +481,10 @@ pub fn duplicate_profile(
         updated_at: now,
         last_used_at: None,
         pinned: false,
-        extra_args: source.extra_args.clone(),
         restart_on_crash: source.restart_on_crash,
-        stop_timeout_secs: source.stop_timeout_secs,
         folder_id: source.folder_id.clone(),
-        groups: Vec::new(),
+        fingerprint: source.fingerprint.clone(),
+        startup_url: source.startup_url.clone(),
     };
 
     insert_profile(&conn, &profile)?;
@@ -557,15 +588,11 @@ mod tests {
     fn new_fields_round_trip_through_the_db() {
         let conn = mem_conn();
         let mut p = test_profile("Tuned", false);
-        p.extra_args = Some("--disable-gpu".into());
         p.restart_on_crash = true;
-        p.stop_timeout_secs = Some(10);
         insert_profile(&conn, &p).unwrap();
 
         let loaded = get_profile_by_id(&conn, &p.id).unwrap();
-        assert_eq!(loaded.extra_args.as_deref(), Some("--disable-gpu"));
         assert!(loaded.restart_on_crash);
-        assert_eq!(loaded.stop_timeout_secs, Some(10));
     }
 
     #[test]
@@ -594,17 +621,64 @@ mod tests {
 
     #[test]
     fn validate_launch_fields_rejects_unknown_browser() {
-        assert!(validate_launch_fields("chrome", None).is_ok());
-        assert!(validate_launch_fields("nobody-browser", None).is_err());
-        assert!(validate_launch_fields("chromium", Some("--user-data-dir=/tmp")).is_err());
+        assert!(validate_launch_fields("chrome").is_ok());
+        assert!(validate_launch_fields("nobody-browser").is_err());
     }
 
     #[test]
-    fn stop_timeout_bounds_are_enforced() {
-        assert!(validate_stop_timeout(None).is_ok());
-        assert!(validate_stop_timeout(Some(1)).is_ok());
-        assert!(validate_stop_timeout(Some(60)).is_ok());
-        assert!(validate_stop_timeout(Some(0)).is_err());
-        assert!(validate_stop_timeout(Some(61)).is_err());
+    fn fingerprint_validation_rejects_unsafe_values() {
+        let ok = Fingerprint {
+            language: Some("en-US".into()),
+            timezone: Some("Europe/Berlin".into()),
+            ..Default::default()
+        };
+        assert!(validate_fingerprint(Some(&ok)).is_ok());
+        assert!(validate_fingerprint(None).is_ok());
+
+        let bad_lang = Fingerprint { language: Some("en US\"".into()), ..Default::default() };
+        assert!(validate_fingerprint(Some(&bad_lang)).is_err());
+        let bad_tz = Fingerprint { timezone: Some("Europe/<script>".into()), ..Default::default() };
+        assert!(validate_fingerprint(Some(&bad_tz)).is_err());
+        let bad_ua = Fingerprint { user_agent: Some("a\nb".into()), ..Default::default() };
+        assert!(validate_fingerprint(Some(&bad_ua)).is_err());
+        let bad_geo = Fingerprint {
+            geolocation: Some(crate::models::profile::Geolocation {
+                latitude: 91.0,
+                longitude: 0.0,
+                accuracy: 50.0,
+            }),
+            ..Default::default()
+        };
+        assert!(validate_fingerprint(Some(&bad_geo)).is_err());
+    }
+
+    #[test]
+    fn startup_url_accepts_only_http_and_https() {
+        assert_eq!(validate_startup_url(None).unwrap(), None);
+        assert_eq!(validate_startup_url(Some("   ")).unwrap(), None);
+        assert_eq!(
+            validate_startup_url(Some(" https://example.com/a ")).unwrap(),
+            Some("https://example.com/a".into())
+        );
+        assert!(validate_startup_url(Some("file:///etc/passwd")).is_err());
+        assert!(validate_startup_url(Some("javascript:alert(1)")).is_err());
+        assert!(validate_startup_url(Some("https://exa mple.com")).is_err());
+        assert!(validate_startup_url(Some("not a url")).is_err());
+    }
+
+    #[test]
+    fn fingerprint_round_trips_and_ignores_corrupt_json() {
+        let fp = Fingerprint {
+            language: Some("de-DE".into()),
+            fonts: Some(vec!["Arial".into()]),
+            ..Default::default()
+        };
+        let stored = encode_fingerprint(&Some(fp.clone())).unwrap();
+        assert_eq!(decode_fingerprint(stored), Some(fp));
+
+        // An empty fingerprint is stored as NULL and read back as None.
+        assert_eq!(encode_fingerprint(&Some(Fingerprint::default())).unwrap(), None);
+        // Corrupt stored JSON must not make the profile unreadable.
+        assert_eq!(decode_fingerprint(Some("{not json".into())), None);
     }
 }

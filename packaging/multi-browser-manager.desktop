@@ -6,5 +6,5 @@ Comment=Manage multiple isolated Chromium browser profiles from one dashboard
 Exec=multi-browser-manager
 Icon=multi-browser-manager
 Terminal=false
-Categories=Utility;Network;
+Categories=Utility;
 StartupNotify=true

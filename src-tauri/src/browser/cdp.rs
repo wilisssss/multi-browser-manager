@@ -1,0 +1,321 @@
+//! Chrome DevTools Protocol control for a launched profile.
+//!
+//! Chromium's branded builds ignore `--load-extension`, so per-profile identity
+//! (viewport, user agent + Client Hints, timezone, the fingerprint script) is
+//! applied over CDP instead: the same mechanism Puppeteer's `setViewport` uses.
+//! Each profile gets its own local debugging port.
+//!
+//! The browser-level WebSocket is used with `Target.setAutoAttach`, so every
+//! page gets the overrides — including tabs opened after launch. Emulation
+//! overrides are per-session and are dropped when a session ends, so each
+//! session is configured as it attaches and the browser connection is held for
+//! the lifetime of the process.
+
+use crate::error::{AppError, AppResult};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::net::TcpListener;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+/// The browser WebSocket, which multiplexes per-target sessions.
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Everything applied to a page right after the browser starts.
+#[derive(Debug, Clone, Default)]
+pub struct Plan {
+    /// Full fingerprint script, run before any page script.
+    pub init_script: Option<String>,
+    pub user_agent: Option<String>,
+    /// Client Hints reported through `navigator.userAgentData`.
+    pub client_hints: Option<ClientHints>,
+    /// Viewport `(width, height)`, applied as a mobile-sized device when `mobile`.
+    pub viewport: Option<(u32, u32)>,
+    pub mobile: bool,
+    pub timezone: Option<String>,
+    pub locale: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientHints {
+    pub platform: String,
+    pub platform_version: String,
+    pub architecture: String,
+    pub model: String,
+    pub mobile: bool,
+    pub full_version: String,
+}
+
+/// Picks a free loopback TCP port for `--remote-debugging-port`.
+pub fn pick_debug_port() -> AppResult<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Applies `plan` to every page of the browser on `port`, now and for the rest
+/// of the process's life. Returns only once the browser connection closes.
+///
+/// Overrides are per-session: they are dropped when the session that set them
+/// ends, and a new tab starts a new session. So rather than configuring the
+/// first page once, the browser endpoint is attached and every page session is
+/// configured as it appears.
+pub async fn apply(port: u16, plan: &Plan) -> AppResult<()> {
+    let ws_url = wait_for_browser_ws(port).await?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .map_err(|e| AppError::validation(format!("CDP connect failed: {e}")))?;
+    let mut id: u64 = 0;
+
+    // Attach to the pages that already exist and to every page opened later.
+    // `waitForDebuggerOnStart` holds a new page until its overrides are applied,
+    // so a tab never paints with the host's default viewport first.
+    let auto_attach = json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true });
+    send_command(&mut ws, &mut id, None, "Target.setAutoAttach", auto_attach).await?;
+
+    let commands = page_identity_commands(plan);
+    let reload_initial = plan.init_script.is_some();
+    // Guards against configuring the same page twice if it re-attaches.
+    let mut configured: HashSet<String> = HashSet::new();
+
+    while let Some(frame) = ws.next().await {
+        let text = match frame {
+            Ok(Message::Text(text)) => text,
+            Ok(_) => continue,
+            Err(_) => break,
+        };
+        let event: Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
+            continue;
+        }
+        let params = &event["params"];
+        let Some(session) = params.get("sessionId").and_then(Value::as_str) else {
+            continue;
+        };
+        let target = &params["targetInfo"];
+        // A page created while attached is held mid-load; a page from before we
+        // attached (or an iframe/worker) is not.
+        let waiting = params
+            .get("waitingForDebugger")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // Non-page targets (services, browser chrome) only need resuming.
+        if target.get("type").and_then(Value::as_str) != Some("page") {
+            if waiting {
+                let _ = send_command(&mut ws, &mut id, Some(session), "Runtime.runIfWaitingForDebugger", json!({}))
+                    .await;
+            }
+            continue;
+        }
+
+        let Some(target_id) = target.get("targetId").and_then(Value::as_str) else {
+            continue;
+        };
+        // Fresh session for this page: (re)apply the overrides.
+        if configured.insert(target_id.to_string()) {
+            for (method, params) in &commands {
+                if let Err(e) = send_command(&mut ws, &mut id, Some(session), method, params.clone()).await {
+                    eprintln!("mbm: CDP {method} failed: {e}");
+                }
+            }
+            // A page that loaded before the init script was registered must be
+            // reloaded for it to take effect. A held page already ran it, so it
+            // is left alone (no visible reload on a fresh tab).
+            if reload_initial && !waiting {
+                let _ = send_command(&mut ws, &mut id, Some(session), "Page.reload", json!({})).await;
+            }
+        }
+        if waiting {
+            let _ = send_command(&mut ws, &mut id, Some(session), "Runtime.runIfWaitingForDebugger", json!({}))
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// The per-page overrides, in the order they must be applied: register the init
+/// script first, then the emulation overrides it complements.
+fn page_identity_commands(plan: &Plan) -> Vec<(String, Value)> {
+    // `Page.enable` is required before `addScriptToEvaluateOnNewDocument`:
+    // without it the registration is accepted but the script never runs.
+    let mut commands: Vec<(String, Value)> =
+        vec![("Page.enable".to_string(), json!({}))];
+
+    if let Some(script) = &plan.init_script {
+        commands.push((
+            "Page.addScriptToEvaluateOnNewDocument".to_string(),
+            json!({ "source": script, "runImmediately": true }),
+        ));
+    }
+    if let Some((w, h)) = plan.viewport {
+        commands.push((
+            "Emulation.setDeviceMetricsOverride".to_string(),
+            json!({ "width": w, "height": h, "deviceScaleFactor": 1, "mobile": plan.mobile,
+                    "screenWidth": w, "screenHeight": h }),
+        ));
+    }
+    if let Some(ua) = &plan.user_agent {
+        let mut params = json!({ "userAgent": ua });
+        if let Some(hints) = &plan.client_hints {
+            let major = hints.full_version.split('.').next().unwrap_or("");
+            params["userAgentMetadata"] = json!({
+                "brands": [
+                    { "brand": "Chromium", "version": major },
+                    { "brand": "Google Chrome", "version": major },
+                    { "brand": "Not.A/Brand", "version": "8" }
+                ],
+                "fullVersion": hints.full_version,
+                "platform": hints.platform,
+                "platformVersion": hints.platform_version,
+                "architecture": hints.architecture,
+                "model": hints.model,
+                "mobile": hints.mobile,
+                "bitness": "64",
+                "wow64": false,
+            });
+        }
+        commands.push(("Emulation.setUserAgentOverride".to_string(), params));
+    }
+    if let Some(tz) = &plan.timezone {
+        commands.push((
+            "Emulation.setTimezoneOverride".to_string(),
+            json!({ "timezoneId": tz }),
+        ));
+    }
+    if let Some(locale) = &plan.locale {
+        commands.push((
+            "Emulation.setLocaleOverride".to_string(),
+            json!({ "locale": locale }),
+        ));
+    }
+
+    commands
+}
+
+/// Sends one command, optionally into a flat session, and waits for its reply.
+/// Events received while waiting are skipped.
+async fn send_command(
+    ws: &mut Ws,
+    id: &mut u64,
+    session: Option<&str>,
+    method: &str,
+    params: Value,
+) -> AppResult<Value> {
+    *id += 1;
+    let cmd_id = *id;
+    let mut message = json!({ "id": cmd_id, "method": method, "params": params });
+    if let Some(session) = session {
+        message["sessionId"] = json!(session);
+    }
+    ws.send(Message::Text(message.to_string().into()))
+        .await
+        .map_err(|e| AppError::validation(format!("CDP send failed: {e}")))?;
+
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .map_err(|_| AppError::validation("CDP command timed out"))?;
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                if reply.get("id").and_then(Value::as_u64) == Some(cmd_id) {
+                    if let Some(err) = reply.get("error") {
+                        return Err(AppError::validation(format!("CDP error: {err}")));
+                    }
+                    return Ok(reply);
+                }
+            }
+            Some(Ok(_)) => {}
+            _ => return Err(AppError::validation("CDP connection closed")),
+        }
+    }
+}
+
+/// Polls `/json/version` until the browser exposes its debugger WebSocket.
+async fn wait_for_browser_ws(port: u16) -> AppResult<String> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
+    let url = format!("http://127.0.0.1:{port}/json/version");
+    for _ in 0..60 {
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(info) = resp.json::<Value>().await {
+                if let Some(ws) = info.get("webSocketDebuggerUrl").and_then(Value::as_str) {
+                    return Ok(ws.to_string());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(AppError::validation("Browser did not expose a debuggable endpoint"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_metrics_carry_the_screen_size() {
+        let plan = Plan { viewport: Some((412, 915)), mobile: true, ..Default::default() };
+        let commands = page_identity_commands(&plan);
+        let (_, params) = commands
+            .iter()
+            .find(|(m, _)| m == "Emulation.setDeviceMetricsOverride")
+            .expect("viewport override");
+        // screenWidth/screenHeight must match, or new tabs report the host's
+        // display size instead of the emulated one.
+        assert_eq!(params["width"], 412);
+        assert_eq!(params["height"], 915);
+        assert_eq!(params["screenWidth"], 412);
+        assert_eq!(params["screenHeight"], 915);
+        assert_eq!(params["mobile"], true);
+    }
+
+    #[test]
+    fn client_hints_are_metadatad_from_the_plan() {
+        let plan = Plan {
+            user_agent: Some("UA".into()),
+            client_hints: Some(ClientHints {
+                platform: "Android".into(),
+                platform_version: "16".into(),
+                architecture: "arm".into(),
+                model: "Pixel 10".into(),
+                mobile: true,
+                full_version: "155.0.8059.79".into(),
+            }),
+            ..Default::default()
+        };
+        let commands = page_identity_commands(&plan);
+        let (_, params) = commands
+            .iter()
+            .find(|(m, _)| m == "Emulation.setUserAgentOverride")
+            .expect("ua override");
+        assert_eq!(params["userAgentMetadata"]["platform"], "Android");
+        assert_eq!(params["userAgentMetadata"]["mobile"], true);
+        assert_eq!(params["userAgentMetadata"]["model"], "Pixel 10");
+    }
+
+    #[test]
+    fn identity_commands_are_ordered_enable_script_metrics() {
+        let plan = Plan {
+            init_script: Some("window.__x=1".into()),
+            viewport: Some((360, 780)),
+            timezone: Some("Europe/Berlin".into()),
+            ..Default::default()
+        };
+        let commands = page_identity_commands(&plan);
+        let methods: Vec<&str> = commands.iter().map(|(m, _)| m.as_str()).collect();
+        // Page.enable must come first: the script registration is ignored
+        // without it.
+        assert_eq!(methods.first().copied(), Some("Page.enable"));
+        let script = methods.iter().position(|m| *m == "Page.addScriptToEvaluateOnNewDocument");
+        let metrics = methods.iter().position(|m| *m == "Emulation.setDeviceMetricsOverride");
+        assert!(script.is_some() && metrics.is_some());
+        assert!(script < metrics, "the init script is registered before the metrics");
+        assert!(methods.contains(&"Emulation.setTimezoneOverride"));
+    }
+}

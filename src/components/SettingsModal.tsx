@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Loader2, Settings as SettingsIcon, Trash2, X } from "lucide-react";
+import { Download, Loader2, Settings as SettingsIcon, Trash2, Upload, X } from "lucide-react";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { emptyTrash, getBackupDir, getSettings, getTrashCount, updateSettings } from "../lib/tauri-api";
 import type { AppSettings } from "../types";
@@ -8,9 +8,12 @@ interface Props {
   onClose: () => void;
   /** Notifies the dashboard so it uses fresh values (e.g. default browser). */
   onSaved: (settings: AppSettings) => void;
+  onExport: () => void;
+  onImport: () => void;
+  busy: boolean;
 }
 
-export function SettingsModal({ onClose, onSaved }: Props) {
+export function SettingsModal({ onClose, onSaved, onExport, onImport, busy }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [backupDir, setBackupDir] = useState("");
   const [trashCount, setTrashCount] = useState<number | null>(null);
@@ -187,6 +190,32 @@ export function SettingsModal({ onClose, onSaved }: Props) {
                 {emptyingTrash ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
                 Empty
               </button>
+            </div>
+
+            {/* Backup export / import (moved here from the header) */}
+            <div className="flex items-center justify-between rounded-lg border border-neutral-200 px-3 py-2.5 dark:border-neutral-800">
+              <div className="text-sm">
+                <p className="font-medium">Export / Import</p>
+                <p className="text-xs text-neutral-500 dark:text-neutral-400">
+                  Backup profiles and proxies to a JSON file.
+                </p>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <button
+                  onClick={onImport}
+                  disabled={busy}
+                  className="flex items-center gap-1.5 rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-medium hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:hover:bg-neutral-800"
+                >
+                  <Upload className="h-3.5 w-3.5" /> Import
+                </button>
+                <button
+                  onClick={onExport}
+                  disabled={busy}
+                  className="flex items-center gap-1.5 rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-medium hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:hover:bg-neutral-800"
+                >
+                  <Download className="h-3.5 w-3.5" /> Export
+                </button>
+              </div>
             </div>
 
             {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}

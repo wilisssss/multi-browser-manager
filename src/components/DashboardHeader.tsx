@@ -1,7 +1,5 @@
 import {
-  AppWindow,
   Command as CommandIcon,
-  Download,
   Globe,
   History as HistoryIcon,
   Keyboard,
@@ -10,7 +8,6 @@ import {
   Settings as SettingsIcon,
   Settings2,
   Sun,
-  Upload,
 } from "lucide-react";
 import type { Theme } from "../hooks/useTheme";
 
@@ -20,16 +17,12 @@ interface Props {
   runningCount: number;
   appVersion: string;
   onOpenPalette: () => void;
-  onOpenRules: () => void;
   onOpenSettings: () => void;
   onOpenHistory: () => void;
   onOpenHelp: () => void;
   onToggleTheme: () => void;
-  onImport: () => void;
-  onExport: () => void;
   onOpenProxies: () => void;
   onCreate: () => void;
-  busy: boolean;
 }
 
 const iconBtn =
@@ -45,16 +38,12 @@ export function DashboardHeader(props: Props) {
     runningCount,
     appVersion,
     onOpenPalette,
-    onOpenRules,
     onOpenSettings,
     onOpenHistory,
     onOpenHelp,
     onToggleTheme,
-    onImport,
-    onExport,
     onOpenProxies,
     onCreate,
-    busy,
   } = props;
 
   return (
@@ -85,9 +74,6 @@ export function DashboardHeader(props: Props) {
         <button onClick={onOpenPalette} title="Command palette (Ctrl+K)" className={iconBtn}>
           <CommandIcon className="h-4 w-4" />
         </button>
-        <button onClick={onOpenRules} title="Window rules & workspaces" className={iconBtn}>
-          <AppWindow className="h-4 w-4" />
-        </button>
         <button onClick={onOpenSettings} title="Settings" className={iconBtn}>
           <SettingsIcon className="h-4 w-4" />
         </button>
@@ -99,12 +85,6 @@ export function DashboardHeader(props: Props) {
         </button>
         <button onClick={onToggleTheme} title="Toggle theme (T)" className={iconBtn}>
           {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-        </button>
-        <button onClick={onImport} disabled={busy} className={labeledBtn}>
-          <Upload className="h-4 w-4" /> Import
-        </button>
-        <button onClick={onExport} disabled={busy} className={labeledBtn}>
-          <Download className="h-4 w-4" /> Export
         </button>
         <button onClick={onOpenProxies} title="Proxy manager (P)" className={labeledBtn}>
           <Settings2 className="h-4 w-4" /> Proxies

@@ -3,15 +3,18 @@
 //! Pure functions over `&Connection` + paths: no Tauri state, so the import
 //! conflict rules are unit-testable against an in-memory database.
 
-use crate::browser::launcher;
-use crate::commands::profile::{insert_profile, list_profiles};
-use crate::commands::proxy::insert_proxy_with_password;
-use crate::error::{AppError, AppResult};
+mod export;
+mod import;
+
+pub use export::{run_snapshot_if_due, write_backup_file, write_encrypted_backup_file};
+pub use import::import_backup_file;
+
+use crate::commands::profile::list_profiles;
+use crate::error::AppResult;
 use crate::models::profile::Profile;
 use crate::models::proxy::Proxy;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// Portable backup file format. Proxy passwords are excluded (they live in
 /// the OS keychain and cannot be exported); credential secrets ARE included
@@ -127,279 +130,6 @@ fn serialize_backup(payload: &BackupPayload, exported_at: i64) -> AppResult<Stri
     Ok(serde_json::to_string_pretty(&backup)?)
 }
 
-/// Writes a plaintext portable backup (profiles + proxies + credentials) to
-/// `path`. Shared by manual export and the automatic snapshot task.
-pub fn write_backup_file(conn: &Connection, path: &Path) -> AppResult<()> {
-    let payload = build_payload(conn)?;
-    let json = serialize_backup(&payload, chrono::Utc::now().timestamp())?;
-    std::fs::write(path, json)?;
-    Ok(())
-}
-
-/// Writes a passphrase-encrypted backup (feature: encrypted export). The
-/// plaintext payload is identical to the plaintext export; only the file on
-/// disk differs.
-pub fn write_encrypted_backup_file(
-    conn: &Connection,
-    path: &Path,
-    passphrase: &str,
-) -> AppResult<()> {
-    super::crypto::validate_passphrase(passphrase)?;
-    let payload = build_payload(conn)?;
-    let json = serialize_backup(&payload, chrono::Utc::now().timestamp())?;
-    let encrypted = super::crypto::encrypt(json.as_bytes(), passphrase)?;
-    std::fs::write(path, encrypted)?;
-    Ok(())
-}
-
-/// Reads + validates + imports a backup file (plaintext or encrypted).
-/// `passphrase` is required only for encrypted files; a `None` on an
-/// encrypted file returns a clear validation error so the UI can prompt.
-pub fn import_backup_file(
-    conn: &mut Connection,
-    profiles_root: &Path,
-    path: &Path,
-    passphrase: Option<&str>,
-) -> AppResult<ImportResult> {
-    let bytes = std::fs::read(path)?;
-    let content = if super::crypto::is_encrypted(&bytes) {
-        let pass = passphrase.ok_or_else(|| {
-            AppError::validation(
-                "This backup is encrypted — provide the passphrase to import it",
-            )
-        })?;
-        String::from_utf8(super::crypto::decrypt(&bytes, pass)?)
-            .map_err(|_| AppError::validation("Decrypted backup is not valid UTF-8"))?
-    } else {
-        String::from_utf8(bytes)
-            .map_err(|_| AppError::validation("Backup file is not valid UTF-8"))?
-    };
-
-    let backup: BackupFile = serde_json::from_str(&content)
-        .map_err(|e| AppError::validation(format!("Invalid backup file: {e}")))?;
-
-    if backup.format_version > FORMAT_VERSION {
-        return Err(AppError::validation(format!(
-            "Backup file version {} is newer than supported version {FORMAT_VERSION}",
-            backup.format_version
-        )));
-    }
-
-    // Validate every entry BEFORE touching the DB so a malformed file fails
-    // cleanly instead of half-importing.
-    for proxy in &backup.proxies {
-        if proxy.label.trim().is_empty() {
-            return Err(AppError::validation(
-                "Backup contains a proxy with an empty label",
-            ));
-        }
-        if let Err(e) = crate::proxy_manager::ensure_valid_protocol(&proxy.protocol) {
-            return Err(AppError::validation(format!(
-                "Backup proxy '{}' has an invalid protocol: {e}",
-                proxy.label
-            )));
-        }
-        if proxy.host.trim().is_empty() || !(1..=65535).contains(&proxy.port) {
-            return Err(AppError::validation(format!(
-                "Backup proxy '{}' has an invalid host/port",
-                proxy.label
-            )));
-        }
-    }
-    for profile in &backup.profiles {
-        if profile.name.trim().is_empty() {
-            return Err(AppError::validation(
-                "Backup contains a profile with an empty name",
-            ));
-        }
-        if let Err(e) = launcher::validate_extra_args(profile.extra_args.as_deref().unwrap_or(""))
-        {
-            return Err(AppError::validation(format!(
-                "Backup profile '{}' has invalid extra args: {e}",
-                profile.name
-            )));
-        }
-    }
-
-    apply_import(conn, profiles_root, &backup)
-}
-
-/// Applies a validated backup inside one transaction: a failure rolls back
-/// everything instead of leaving a partial import behind.
-fn apply_import(
-    conn: &mut Connection,
-    profiles_root: &Path,
-    backup: &BackupFile,
-) -> AppResult<ImportResult> {
-    let mut result = ImportResult::empty();
-    let tx = conn.transaction()?;
-
-    // Backup credentials reference the profile ids of the exporting machine;
-    // map them to the ids actually created (or already present) here.
-    let mut profile_id_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-
-    // Import proxies first so profile FK references stay valid.
-    for proxy in &backup.proxies {
-        let conflict: Option<String> = tx
-            .query_row(
-                "SELECT label FROM proxies WHERE id = ?1 OR label = ?2 LIMIT 1",
-                params![proxy.id, proxy.label],
-                |r| r.get::<_, String>(0),
-            )
-            .ok();
-
-        if conflict.is_some() {
-            result.skipped_proxies += 1;
-            result
-                .conflicts
-                .push(format!("Proxy '{}' already exists — skipped", proxy.label));
-            continue;
-        }
-
-        insert_proxy_with_password(&tx, proxy, None)?;
-        result.imported_proxies += 1;
-    }
-
-    for profile in &backup.profiles {
-        // Conflict = same name OR same data dir. The id lookup below uses the
-        // exact same condition so a dir-conflict under a different name also
-        // maps credentials onto the existing profile (was name-only: import
-        // silently dropped the credentials in that case).
-        let conflict: Option<String> = tx
-            .query_row(
-                "SELECT name FROM profiles WHERE name = ?1 COLLATE NOCASE OR user_data_dir = ?2 LIMIT 1",
-                params![profile.name, profile.user_data_dir],
-                |r| r.get::<_, String>(0),
-            )
-            .ok();
-
-        if conflict.is_some() {
-            result.skipped_profiles += 1;
-            result
-                .conflicts
-                .push(format!("Profile '{}' already exists — skipped", profile.name));
-            // Credentials of a skipped profile attach to the existing profile.
-            if let Ok(local_id) = tx.query_row(
-                "SELECT id FROM profiles WHERE name = ?1 COLLATE NOCASE OR user_data_dir = ?2 LIMIT 1",
-                params![profile.name, profile.user_data_dir],
-                |r| r.get::<_, String>(0),
-            ) {
-                profile_id_map.insert(profile.id.clone(), local_id);
-            }
-            continue;
-        }
-
-        // Create a fresh data dir for the imported profile on this machine.
-        let new_id = uuid::Uuid::new_v4().to_string();
-        let user_data_dir = profiles_root
-            .join(&new_id)
-            .to_string_lossy()
-            .to_string();
-        launcher::ensure_user_data_dir(Path::new(&user_data_dir))?;
-
-        // If the referenced proxy didn't make it in (skipped on conflict or
-        // missing from the backup), drop the reference instead of failing the
-        // whole import with a foreign-key violation.
-        let proxy_id = match &profile.proxy_id {
-            Some(pid) => {
-                let exists: bool = tx.query_row(
-                    "SELECT COUNT(*) > 0 FROM proxies WHERE id = ?1",
-                    params![pid],
-                    |r| r.get(0),
-                )?;
-                if exists { Some(pid.clone()) } else { None }
-            }
-            None => None,
-        };
-
-        let now = chrono::Utc::now().timestamp();
-        let imported = Profile {
-            id: new_id.clone(),
-            name: profile.name.clone(),
-            browser_type: profile.browser_type.clone(),
-            user_data_dir,
-            proxy_id,
-            notes: profile.notes.clone(),
-            status: "stopped".to_string(),
-            created_at: now,
-            updated_at: now,
-            last_used_at: None,
-            pinned: profile.pinned,
-            extra_args: profile.extra_args.clone(),
-            restart_on_crash: profile.restart_on_crash,
-            stop_timeout_secs: profile.stop_timeout_secs,
-            folder_id: None, // folders are local-only; imports land unfiled
-            groups: Vec::new(),
-        };
-        insert_profile(&tx, &imported)?;
-
-        // Restore tag assignments; tags missing from this DB are skipped.
-        for group in &profile.groups {
-            let exists: bool = tx.query_row(
-                "SELECT COUNT(*) > 0 FROM groups WHERE name = ?1",
-                params![group.name],
-                |r| r.get(0),
-            )?;
-            if exists {
-                tx.execute(
-                    "INSERT OR IGNORE INTO profile_groups (profile_id, group_id)
-                     SELECT ?1, id FROM groups WHERE name = ?2",
-                    params![new_id, group.name],
-                )?;
-            }
-        }
-
-        profile_id_map.insert(profile.id.clone(), new_id);
-
-        result.imported_profiles += 1;
-    }
-
-    // Import credentials last, remapped to the local profile ids.
-    for cred in &backup.credentials {
-        let Some(target_profile) = profile_id_map.get(&cred.profile_id) else {
-            result.skipped_credentials += 1;
-            result
-                .conflicts
-                .push(format!("Credential '{}' — profile not found, skipped", cred.label));
-            continue;
-        };
-
-        // Dedupe: same profile + platform + username already present.
-        let dup: bool = tx.query_row(
-            "SELECT COUNT(*) > 0 FROM credentials WHERE profile_id = ?1 AND platform = ?2
-             AND COALESCE(username, '') = COALESCE(?3, '')",
-            params![target_profile, cred.platform, cred.username],
-            |r| r.get(0),
-        )?;
-        if dup {
-            result.skipped_credentials += 1;
-            continue;
-        }
-
-        tx.execute(
-            "INSERT INTO credentials (id, profile_id, platform, label, username, password, seed_phrase, evm_address, notes, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-            params![
-                uuid::Uuid::new_v4().to_string(),
-                target_profile,
-                cred.platform,
-                cred.label,
-                cred.username,
-                cred.password,
-                cred.seed_phrase,
-                cred.evm_address,
-                cred.notes,
-                chrono::Utc::now().timestamp()
-            ],
-        )?;
-        result.imported_credentials += 1;
-    }
-
-    tx.commit()?;
-    Ok(result)
-}
-
 /// Deterministic content fingerprint used for "did the config change"
 /// equality — never a security property. Deliberately NOT DefaultHasher:
 /// its seed is randomized per process, so a hash persisted across restarts
@@ -417,104 +147,13 @@ fn payload_hash(payload: &BackupPayload) -> AppResult<String> {
     Ok(content_hash(serde_json::to_vec(payload)?.as_slice()))
 }
 
-/// Automatic snapshot: writes a timestamped backup into `<data>/backups/` at
-/// most once a day AND only when the backup payload actually changed (content
-/// hash compared against the newest snapshot's hash, persisted in a sidecar
-/// file so it survives MBM restarts), then prunes to the newest
-/// `auto_backup_keep` files. Returns the written path on success.
-pub fn run_snapshot_if_due(state: &crate::AppState) -> Option<std::path::PathBuf> {
-    let (settings, conn) = {
-        let conn = crate::commands::profile::db_lock(state).ok()?;
-        (crate::commands::settings::load_settings(&conn), conn)
-    };
-    if !settings.auto_backup {
-        return None;
-    }
-
-    let dir = state.profiles_root.parent()?.join("backups");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("mbm: failed to create backups dir: {e}");
-        return None;
-    }
-
-    // Build the payload in memory first; only touch disk when its content
-    // differs from the last accepted snapshot.
-    let payload = match build_payload(&conn) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("mbm: auto-backup failed: {e}");
-            return None;
-        }
-    };
-    let hash = match payload_hash(&payload) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("mbm: auto-backup hashing failed: {e}");
-            return None;
-        }
-    };
-    let hash_file = dir.join(".last-hash");
-    if std::fs::read_to_string(&hash_file).ok().as_deref() == Some(hash.as_str()) {
-        return None; // nothing changed since the last snapshot
-    }
-
-    // Collect existing snapshots, newest modification time first.
-    let mut snapshots: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("mbm-auto-") && name.ends_with(".json") {
-                let mtime = e.metadata().ok()?.modified().ok()?;
-                Some((mtime, e.path()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    snapshots.sort_by(|a, b| b.0.cmp(&a.0));
-
-    // Due when there is no snapshot yet or the newest is older than 24 h.
-    let due = match snapshots.first() {
-        None => true,
-        Some((mtime, _)) => mtime.elapsed().map(|d| d.as_secs() > 24 * 3600).unwrap_or(true),
-    };
-    if !due {
-        return None;
-    }
-
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let path = dir.join(format!("mbm-auto-{stamp}.json"));
-    let json = match serialize_backup(&payload, chrono::Utc::now().timestamp()) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("mbm: auto-backup serialization failed: {e}");
-            return None;
-        }
-    };
-    if let Err(e) = std::fs::write(&path, json) {
-        eprintln!("mbm: auto-backup failed: {e}");
-        return None;
-    }
-    // Remember the accepted content hash (best-effort: a failure here only
-    // means the next check writes a duplicate snapshot, not data loss).
-    let _ = std::fs::write(&hash_file, &hash);
-
-    // Prune older snapshots beyond the configured keep count.
-    let keep = settings.auto_backup_keep.max(1) as usize;
-    for (_, old) in snapshots.iter().skip(keep.saturating_sub(1)) {
-        if let Err(e) = std::fs::remove_file(old) {
-            eprintln!("mbm: failed to prune old snapshot {}: {e}", old.display());
-        }
-    }
-    eprintln!("mbm: auto-backup written to {}", path.display());
-    Some(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::import::apply_import;
     use crate::db;
+    use rusqlite::params;
+    use std::path::Path;
 
     fn mem_conn() -> Connection {
         db::init(Path::new(":memory:")).expect("in-memory db")
@@ -726,8 +365,5 @@ mod tests {
         let p: Profile = serde_json::from_str(json).unwrap();
         assert!(!p.pinned);
         assert!(!p.restart_on_crash);
-        assert!(p.extra_args.is_none());
-        assert!(p.stop_timeout_secs.is_none());
-        assert!(p.groups.is_empty());
     }
 }

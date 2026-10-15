@@ -10,7 +10,6 @@ Dibangun dengan **Tauri v2 (Rust)** + **React + Vite + TailwindCSS**.
 - **Launch / stop browser** per profile, dengan deteksi otomatis saat browser ditutup manual (event `profile-stopped`)
 - **Bulk launch / stop** — tombol "Launch all" / "Stop all" di toolbar
 - **System tray** — menu tray: Show Dashboard, toggle launch/stop per profile (● running / ○ stopped), **Stop all browsers**, Quit. Menutup window (via compositor, mis. niri) keluar dari app; browser yang masih jalan dibiarkan hidup dan statusnya direkonsiliasi saat MBM dibuka lagi. Ikon tray muncul di status bar apa pun yang mendukung SNI (QuickShell, Waybar, dst.). Butuh `libayatana-appindicator` di Linux; tanpa itu app tetap jalan (tray dilewati). Rebuild menu di-debounce lewat satu worker thread.
-- **Tags / groups** — beri label berwarna pada profile, filter by tag di toolbar
 - **Pin profile** — profile yang di-pin selalu di atas (urutan: pinned → nama)
 - **Deteksi browser** terinstall (Linux / Windows / macOS), termasuk versi
 - **Proxy per profile** — HTTP & SOCKS5:
@@ -23,13 +22,14 @@ Dibangun dengan **Tauri v2 (Rust)** + **React + Vite + TailwindCSS**.
   - Password, seed phrase & EVM address tersimpan **plaintext di database lokal** (desain sadar untuk penggunaan pribadi: data terproteksi permission folder `0700`, bukan OS keychain) dan **ikut di export/import** untuk migrasi antar device. Jangan export file backup ke tempat yang tidak kamu percaya — siapa pun yang punya file itu punya semua akunmu.
   - Platform picker dengan icon brand; field mengikuti template platform; copy password/seed phrase satu klik dari list
   - Duplicate profile ikut menyalin kredensial; delete profile membersihkan semuanya
-- **Export / import** konfigurasi profile + proxy + tags + credentials (JSON), **opsi terenkripsi passphrase** (Argon2id + AES-256-GCM): file terenkripsi tidak bisa dibaca tanpa passphrase; import file terenkripsi otomatis meminta passphrase. Password proxy tidak ikut; **secret kredensial ikut** (lihat peringatan di Credentials) — simpan file backup hanya di tempat terpercaya.
-- **Extra launch args per profile** — power-user bisa menambah argumen CLI browser (`--disable-gpu`, `--start-maximized`, URL awal, dst.); flag yang dikelola MBM (`--user-data-dir`, `--proxy-server`, `--load-extension`, `--class`) ditolak saat simpan.
+- **Export / import** konfigurasi profile + proxy + credentials (JSON), **opsi terenkripsi passphrase** (Argon2id + AES-256-GCM): file terenkripsi tidak bisa dibaca tanpa passphrase; import file terenkripsi otomatis meminta passphrase. Password proxy tidak ikut; **secret kredensial ikut** (lihat peringatan di Credentials) — simpan file backup hanya di tempat terpercaya.
 - **Folder untuk profil** — kelola profil seperti file manager: buat folder (bisa bertingkat/subfolder), pindahkan profil antar folder, rename, dan hapus (isi folder naik satu level, tidak ada yang hilang). Root hanya menampilkan folder — daftar profil muncul saat folder dibuka, termasuk pintasan "Unfiled" untuk profil tanpa folder. Navigasi breadcrumb + tombol back ke folder induk.
 - **Mode hemat RAM** (Settings, default aktif) — browser diluncurkan dengan flag penyetel memori: `--process-per-site`, tanpa media router / translate / sync / prediksi jaringan / component-extension background pages / back-forward cache. Menghemat ratusan MB per profile saat idle; isolasi antar profile tetap penuh (dari `user-data-dir`, bukan flag ini). Bisa dimatikan di Settings jika butuh perilaku Chrome penuh.
 - **Resource usage per profile** — RAM/CPU seluruh process tree browser yang sedang jalan (Linux, via `/proc`), panel Resources di toolbar + badge live di kartu.
 - **Statistik usage** — total jam sesi per profile dari launch history; sorting "Most used" + badge di kartu.
-- **Restart on crash & stop timeout per profile** — profile farming bisa di-set auto-restart (maks 3x per sesi launch) saat browser exit tidak wajar, plus grace period stop per profile (default 3 detik).
+- **Fingerprint per profile** (opsional) — override bahasa, user agent, timezone, platform, geolokasi, daftar font, dan ukuran layar; viewport emulasi diterapkan ke **setiap tab** (termasuk tab baru) lewat CDP, bukan hanya tab pertama. Semua override bersifat best-effort, bukan anti-deteksi sempurna.
+- **Disable WebRTC per profile** — memblokir kebocoran IP asli lewat WebRTC (jalur umum saat memakai proxy): server ICE dikosongkan, event kandidat disembunyikan, baris `a=candidate` dibuang dari SDP, dan Chromium dijalankan dengan `--webrtc-ip-handling-policy=disable_non_proxied_udp`. Konsekuensinya panggilan video/voice tidak berfungsi di profile itu.
+- **Restart on crash per profile** — profile farming bisa di-set auto-restart (maks 3x per sesi launch) saat browser exit tidak wajar; grace period stop tetap 3 detik.
 - **Delete ke trash (undo)** — delete memindahkan folder data ke trash + snapshot profile/kredensial; banner Undo 30 detik, snapshot dibersihkan otomatis setelah 30 hari; "Empty trash" ada di Settings.
 - **Orphan recovery** — browser yang tertinggal dari sesi sebelumnya terdeteksi saat startup (status `running` kembali benar) dan tetap bisa di-stop. Deteksi ini mengandalkan symlink `SingletonLock` + `/proc` sehingga **hanya berfungsi di Linux**; di Windows/macOS profile yang tertinggal tetap bisa di-launch ulang dengan aman (data tidak korup), hanya statusnya tidak otomatis dikoreksi.
 - **Notifikasi desktop untuk CLI** — kegagalan `--launch`/`--stop` dari keybind WM muncul sebagai notifikasi, bukan hanya stderr
@@ -39,7 +39,6 @@ Dibangun dengan **Tauri v2 (Rust)** + **React + Vite + TailwindCSS**.
 - **Launch history** (tombol History / `H`) — durasi sesi per profile
 - **Settings** — retensi & batas launch history, backup otomatis on/off + jumlah snapshot, default browser type untuk profile baru
 - **Auto-snapshot backup** — sekali sehari (jika berubah) snapshot profile+proxy+credentials ke `~/.local/share/multibrowsermanager/backups/`, auto-prune. Folder data sudah `0700`, tapi ingat snapshot berisi secret kredensial (lihat peringatan Credentials).
-- **Window rules & workspaces niri** — setiap browser diluncurkan dengan app-id unik (`--class`/`--wayland-app-id` = `mbm-<nama>-<id>`); modal khusus menampilkan app-id per profile, mapping tag → workspace, dan generator snippet `window-rule { match app-id=... open-on-workspace ... }`
 - **CLI + WM keybinds** — launch/stop profile langsung dari keybind compositor (niri, dst.), fuzzel menu dengan indikator status ●/○
 
 ## CLI & Keybinds niri
@@ -137,8 +136,8 @@ Rilis dibuat otomatis oleh GitHub Actions (`.github/workflows/release.yml`) saat
 Versi tag harus sama dengan `version` di `package.json`:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 CI membangun `multi-browser-manager-<ver>-1-x86_64.pkg.tar.zst` di container Arch dan melampirkannya ke GitHub Release.
