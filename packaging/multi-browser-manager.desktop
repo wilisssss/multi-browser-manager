@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Multi Browser Manager
+GenericName=Browser Profile Manager
+Comment=Manage multiple isolated Chromium browser profiles from one dashboard
+Exec=multi-browser-manager
+Icon=multi-browser-manager
+Terminal=false
+Categories=Utility;Network;
+StartupNotify=true

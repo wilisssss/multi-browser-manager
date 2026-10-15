@@ -13,3 +13,6 @@ src-tauri/gen/
 
 # OS
 .DS_Store
+
+# Arch package output
+release/

@@ -24,7 +24,6 @@ import { useProfiles } from "../hooks/useProfiles";
 import { useProxies } from "../hooks/useProxies";
 import { useGroups } from "../hooks/useGroups";
 import { useFolders } from "../hooks/useFolders";
-import { useUpdater } from "../hooks/useUpdater";
 import { useProfileFilters } from "../hooks/useProfileFilters";
 import { ProfileList } from "./ProfileList";
 import { ProfileForm } from "./ProfileForm";
@@ -114,7 +113,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
   const proxiesState = useProxies();
   const groupsState = useGroups();
   const foldersState = useFolders();
-  const updater = useUpdater();
 
   /** Currently open folder: null = root (folders only), UNFILED = unfiled view. */
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
@@ -613,13 +611,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
       action: profilesState.refresh,
     },
     {
-      id: "check-updates",
-      label: "Check for updates",
-      section: "Actions",
-      icon: Download,
-      action: updater.checkForUpdates,
-    },
-    {
       id: "export",
       label: "Export backup...",
       section: "Actions",
@@ -672,7 +663,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
         profileCount={profilesState.profiles.length}
         runningCount={runningCount}
         appVersion={appVersion}
-        updaterBusy={updater.status.state === "checking" || updater.status.state === "downloading"}
         onOpenPalette={() => setModal({ kind: "palette" })}
         onOpenRules={() => setModal({ kind: "rules" })}
         onOpenSettings={() => setModal({ kind: "settings" })}
@@ -681,7 +671,6 @@ export function Dashboard({ theme, toggleTheme }: Props) {
           setModal({ kind: "history" });
         }}
         onOpenHelp={() => setModal({ kind: "help" })}
-        onCheckUpdates={updater.checkForUpdates}
         onToggleTheme={toggleTheme}
         onImport={() => handleImport()}
         onExport={() => handleExport()}
@@ -690,13 +679,7 @@ export function Dashboard({ theme, toggleTheme }: Props) {
         busy={busy}
       />
 
-      <Banners
-        error={profilesState.error}
-        onDismissError={() => profilesState.setError(null)}
-        status={updater.status}
-        onInstallUpdate={updater.install}
-        onDismissUpdate={updater.dismiss}
-      />
+      <Banners error={profilesState.error} onDismissError={() => profilesState.setError(null)} />
 
       {/* F6: undo banner for a just-deleted profile. */}
       {undoTrash && (

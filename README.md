@@ -37,7 +37,6 @@ Dibangun dengan **Tauri v2 (Rust)** + **React + Vite + TailwindCSS**.
 - **Keyboard shortcuts** in-app (tekan `?` di dashboard untuk daftar)
 - **Command palette (`Ctrl+K`)** — cari profile/aksi (launch, stop, edit, export, theme, dst.) dengan navigasi keyboard
 - **Launch history** (tombol History / `H`) — durasi sesi per profile
-- **Auto-updater** — cek update via tombol di header (tauri-plugin-updater)
 - **Settings** — retensi & batas launch history, backup otomatis on/off + jumlah snapshot, default browser type untuk profile baru
 - **Auto-snapshot backup** — sekali sehari (jika berubah) snapshot profile+proxy+credentials ke `~/.local/share/multibrowsermanager/backups/`, auto-prune. Folder data sudah `0700`, tapi ingat snapshot berisi secret kredensial (lihat peringatan Credentials).
 - **Window rules & workspaces niri** — setiap browser diluncurkan dengan app-id unik (`--class`/`--wayland-app-id` = `mbm-<nama>-<id>`); modal khusus menampilkan app-id per profile, mapping tag → workspace, dan generator snippet `window-rule { match app-id=... open-on-workspace ... }`
@@ -97,25 +96,21 @@ npm install
 npm run tauri dev      # menjalankan vite dev server + app
 ```
 
-## Build binary standalone / release
+## Build & install (Arch Linux)
+
+Paket pacman `.pkg.tar.zst` dibuat dengan script (tanpa `makepkg`):
 
 ```bash
-npm run tauri build    # release build + installer (.deb / .AppImage / .rpm)
+./scripts/build-arch-pkg.sh          # hasil: release/multi-browser-manager-<ver>-1-x86_64.pkg.tar.zst
+sudo pacman -U release/multi-browser-manager-*.pkg.tar.zst
 ```
 
-Binary debug yang bisa jalan sendiri (UI ter-embed dari `dist/`, tanpa dev server):
+Dependensi runtime (`webkit2gtk-4.1`, `gtk3`, `libayatana-appindicator`, `dbus`) ditarik otomatis oleh pacman.
+Build butuh `rust`, `nodejs`, `npm`, dan `zstd`.
 
-```bash
-npm run app   # = npm run build + cargo build --features custom-protocol
-```
-
-> **Penting:** selalu build standalone binary via `npm run app`. Cargo tidak
-> mengingat feature antar-build — kalau ada build lain berjalan tanpa feature
-> `custom-protocol` (mis. `cargo build` polos atau `cargo test`), binary berikutnya
-> bisa ter-build dalam mode dev: app akan mencoba memuat UI dari
-> `http://localhost:5183` (devUrl) dan menampilkan "Could not connect to
-> localhost: Connection refused" kalau `npm run dev` tidak sedang berjalan.
-> Solusinya: jalankan lagi `npm run app` lalu restart `mbm`.
+> **Catatan:** build menggunakan `npx tauri build --no-bundle`, yang sudah mengaktifkan `custom-protocol`
+> sehingga UI ter-embed di binary. Jangan build dengan `cargo build` polos untuk binary yang dipakai
+> sehari-hari: binary tanpa `custom-protocol` mencoba memuat UI dari `http://localhost:5183`.
 
 ## Testing
 
@@ -136,42 +131,17 @@ npm run build                # type-check + build frontend
 - Panel **Resource usage** hanya tersedia di Linux (dibaca dari `/proc`); di OS lain daftarnya kosong dan badge RAM/CPU disembunyikan.
 - **CSP** produksi dikunci (`default-src 'self'` di `tauri.conf.json`) — webview tidak boleh memuat resource eksternal; ini menutup vektor XSS→ekfiltrasi secret kredensial dari modal credentials.
 
-## Auto-updater (setup release)
+## Rilis
 
-Updater sudah ter-wire (tauri-plugin-updater + tombol "Check updates" di header). Untuk rilis:
+Rilis dibuat otomatis oleh GitHub Actions (`.github/workflows/release.yml`) saat tag `v*` di-push.
+Versi tag harus sama dengan `version` di `package.json`:
 
-1. Endpoint update dikonfigurasi di `src-tauri/tauri.conf.json` → `plugins.updater.endpoints` — ganti `YOUR_USER` dengan repo GitHub kamu.
-2. Public key sudah ter-set di config; **private key** signing ada di `~/.tauri/mbm-updater.key` (JANGAN di-commit). Saat build release:
-   ```bash
-   TAURI_SIGNING_PRIVATE_KEY=~/.tauri/mbm-updater.key TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" npm run tauri build
-   ```
-3. Upload artefak + `latest.json` (dihasilkan updater) ke GitHub Releases.
-4. Di Linux, updater hanya mendukung bundle **AppImage** (deb/rpm update via package manager).
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
 
-### Release via GitHub Actions (otomatis)
-
-`.github/workflows/release.yml` mem-build AppImage + .deb dan membuat GitHub Release
-(lengkap dengan `latest.json` untuk auto-updater) setiap kali tag `v*` di-push.
-
-Setup sekali:
-
-1. Buat repo GitHub, lalu:
-   ```bash
-   git remote add origin git@github.com:USERNAME/multi-browser-manager.git
-   git push -u origin main
-   ```
-2. Ganti `YOUR_USER` di `src-tauri/tauri.conf.json` → `plugins.updater.endpoints`
-   dengan username GitHub kamu.
-3. Tambahkan **Secrets** di repo (Settings → Secrets and variables → Actions):
-   - `TAURI_SIGNING_PRIVATE_KEY` → isi file `~/.tauri/mbm-updater.key`
-   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` → kosongkan (key dibuat tanpa password)
-4. Rilis:
-   ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
-   CI akan membuat release + aset: `*.AppImage`, `*.AppImage.sig`, `*.deb`,
-   `*.deb.sig`, dan `latest.json` (URL updater: `.../releases/latest/download/latest.json`).
+CI membangun `multi-browser-manager-<ver>-1-x86_64.pkg.tar.zst` di container Arch dan melampirkannya ke GitHub Release.
 
 ## Keyboard shortcuts (in-app)
 

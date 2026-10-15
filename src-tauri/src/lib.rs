@@ -282,8 +282,6 @@ pub fn run() {
                 & !tauri_plugin_window_state::StateFlags::SIZE,
         ).build())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
         .setup(move |app| {
             let data_root = app_data_root();
             std::fs::create_dir_all(&data_root)?;

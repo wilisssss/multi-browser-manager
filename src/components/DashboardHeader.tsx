@@ -7,7 +7,6 @@ import {
   Keyboard,
   Moon,
   Plus,
-  RefreshCw,
   Settings as SettingsIcon,
   Settings2,
   Sun,
@@ -20,14 +19,11 @@ interface Props {
   profileCount: number;
   runningCount: number;
   appVersion: string;
-  /** True while the updater is checking or downloading. */
-  updaterBusy: boolean;
   onOpenPalette: () => void;
   onOpenRules: () => void;
   onOpenSettings: () => void;
   onOpenHistory: () => void;
   onOpenHelp: () => void;
-  onCheckUpdates: () => void;
   onToggleTheme: () => void;
   onImport: () => void;
   onExport: () => void;
@@ -48,13 +44,11 @@ export function DashboardHeader(props: Props) {
     profileCount,
     runningCount,
     appVersion,
-    updaterBusy,
     onOpenPalette,
     onOpenRules,
     onOpenSettings,
     onOpenHistory,
     onOpenHelp,
-    onCheckUpdates,
     onToggleTheme,
     onImport,
     onExport,
@@ -102,14 +96,6 @@ export function DashboardHeader(props: Props) {
         </button>
         <button onClick={onOpenHelp} title="Keyboard shortcuts (?)" className={iconBtn}>
           <Keyboard className="h-4 w-4" />
-        </button>
-        <button
-          onClick={onCheckUpdates}
-          disabled={updaterBusy}
-          title={`Check for updates${appVersion ? ` (current: v${appVersion})` : ""}`}
-          className={iconBtn}
-        >
-          {updaterBusy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
         </button>
         <button onClick={onToggleTheme} title="Toggle theme (T)" className={iconBtn}>
           {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
