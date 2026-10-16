@@ -30,7 +30,7 @@ export interface Fingerprint {
   fonts?: string[] | null;
   screen?: Screen | null;
   /** Block WebRTC from revealing the host IP. Calls will not connect. */
-  disableWebRTC?: boolean;
+  disableWebrtc?: boolean;
 }
 
 /** Reported screen size in CSS pixels. */

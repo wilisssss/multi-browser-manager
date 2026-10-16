@@ -23,6 +23,10 @@ pub struct LaunchSpec {
     /// Route WebRTC only through the proxy, so the real LAN/public IP is not
     /// exposed through ICE candidates.
     pub webrtc_proxy_only: bool,
+    /// True when the profile has a proxy (flag or auth extension). When false,
+    /// `--no-proxy-server` is passed so a proxy config a previous launch's
+    /// extension left in the profile's Preferences cannot keep applying.
+    pub proxy_enabled: bool,
     /// Block WebRTC entirely (no ICE servers, no candidates). Overrides
     /// `webrtc_proxy_only`.
     pub disable_webrtc: bool,
@@ -30,9 +34,53 @@ pub struct LaunchSpec {
     pub env: Vec<(String, String)>,
     /// Local port for `--remote-debugging-port`, used to apply identity over CDP.
     pub debug_port: Option<u16>,
+    /// When set, the browser must point at the local forwarder (`--proxy-server
+    /// = http://127.0.0.1:<port>`) instead of the upstream proxy directly. The
+    /// forwarder injects proxy credentials, so the browser never has to answer
+    /// a 407 (unreliable through Chromium MV3 extension auth).
+    pub proxy_forwarder: Option<crate::browser::proxy_forwarder::UpstreamConfig>,
     /// Memory-trim ("lightweight") mode: append the curated RAM-saving flags
     /// (see `MEMORY_TRIM_FLAGS`). Driven by the global settings toggle.
     pub trim_memory: bool,
+}
+
+/// Removes proxy configs a previous launch's proxy extension left in the
+/// profile's `Default/Preferences`. Chromium stores `chrome.proxy` settings
+/// there and keeps applying them after the extension is gone — outranking
+/// even command-line proxy flags — so a removed or replaced proxy would
+/// silently stay in effect. Callers must only invoke it while the browser is
+/// stopped (right after the singleton check).
+pub fn scrub_stale_proxy_prefs(user_data_dir: &Path) {
+    let path = user_data_dir.join("Default").join("Preferences");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut prefs) = serde_json::from_str::<serde_json::Value>(&text) else {
+        eprintln!("mbm: could not parse Preferences; skipping stale proxy scrub");
+        return;
+    };
+    let Some(settings) = prefs
+        .get_mut("extensions")
+        .and_then(|e| e.get_mut("settings"))
+        .and_then(|s| s.as_object_mut())
+    else {
+        return;
+    };
+    let mut changed = false;
+    for ext in settings.values_mut() {
+        let Some(ext_prefs) = ext.get_mut("preferences").and_then(|p| p.as_object_mut()) else {
+            continue;
+        };
+        if ext_prefs.remove("proxy").is_some() {
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, prefs.to_string()) {
+        eprintln!("mbm: failed to write scrubbed Preferences: {e}");
+    }
 }
 
 /// Builds the Chromium command-line argument list for a launch spec.
@@ -45,6 +93,12 @@ pub fn build_args(spec: &LaunchSpec) -> Vec<String> {
 
     if let Some(proxy) = &spec.proxy_server {
         args.push(format!("--proxy-server={proxy}"));
+    } else if !spec.proxy_enabled {
+        // "No proxy" must mean no proxy: a previous launch's proxy extension
+        // leaves its chrome.proxy config in the profile's Preferences, and
+        // Chromium keeps honouring it on later launches. This flag outranks
+        // every other proxy source (extension config, system settings).
+        args.push("--no-proxy-server".into());
     }
 
     // Chromium does not merge repeated --disable-features (the last one
@@ -256,6 +310,41 @@ mod tests {
             user_data_dir: "/tmp/mbm/p1".into(),
             proxy_server: None,
             extension_paths: Vec::new(),
+            proxy_forwarder: None,
+            language: None,
+            user_agent: None,
+            startup_url: None,
+            window_size: None,
+            webrtc_proxy_only: false,
+            disable_webrtc: false,
+            proxy_enabled: false,
+            env: Vec::new(),
+            debug_port: None,
+            trim_memory: false,
+        };
+        let args = build_args(&spec);
+        assert!(args.contains(&"--user-data-dir=/tmp/mbm/p1".to_string()));
+        assert!(args.contains(&"--no-first-run".to_string()));
+        assert!(args.contains(&"--no-default-browser-check".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("--proxy-server")));
+        assert!(!args.iter().any(|a| a.starts_with("--load-extension")));
+        // Without a proxy the browser must be pinned to direct connections, or
+        // a proxy config left in the profile's Preferences by an earlier
+        // launch keeps routing traffic.
+        assert!(args.iter().any(|a| a == "--no-proxy-server"));
+    }
+
+    #[test]
+    fn no_proxy_flag_is_omitted_when_a_proxy_is_set() {
+        let spec = LaunchSpec {
+            executable_path: "/usr/bin/chromium".into(),
+            user_data_dir: "/tmp/mbm/p1".into(),
+            // Auth proxy: no --proxy-server flag, the extension carries it,
+            // but the profile is still proxied.
+            proxy_server: None,
+            proxy_enabled: true,
+            extension_paths: vec!["/tmp/mbm/ext/proxy".into()],
+            proxy_forwarder: None,
             language: None,
             user_agent: None,
             startup_url: None,
@@ -267,11 +356,8 @@ mod tests {
             trim_memory: false,
         };
         let args = build_args(&spec);
-        assert!(args.contains(&"--user-data-dir=/tmp/mbm/p1".to_string()));
-        assert!(args.contains(&"--no-first-run".to_string()));
-        assert!(args.contains(&"--no-default-browser-check".to_string()));
-        assert!(!args.iter().any(|a| a.starts_with("--proxy-server")));
-        assert!(!args.iter().any(|a| a.starts_with("--load-extension")));
+        assert!(args.iter().any(|a| a == "--load-extension=/tmp/mbm/ext/proxy"));
+        assert!(!args.iter().any(|a| a == "--no-proxy-server"));
     }
 
     #[test]
@@ -281,12 +367,14 @@ mod tests {
             user_data_dir: "/tmp/mbm/p1".into(),
             proxy_server: Some("socks5://10.0.0.1:1080".into()),
             extension_paths: Vec::new(),
+            proxy_forwarder: None,
             language: None,
             user_agent: None,
             startup_url: None,
             window_size: None,
             webrtc_proxy_only: false,
             disable_webrtc: false,
+            proxy_enabled: false,
             env: Vec::new(),
             debug_port: None,
             trim_memory: false,
@@ -303,12 +391,14 @@ mod tests {
             user_data_dir: "/tmp/mbm/p1".into(),
             proxy_server: None,
             extension_paths: vec!["/tmp/mbm-ext/p1".into()],
+            proxy_forwarder: None,
             language: None,
             user_agent: None,
             startup_url: None,
             window_size: None,
             webrtc_proxy_only: false,
             disable_webrtc: false,
+            proxy_enabled: false,
             env: Vec::new(),
             debug_port: None,
             trim_memory: false,
@@ -326,6 +416,7 @@ mod tests {
             user_data_dir: "/tmp/p".into(),
             proxy_server: None,
             extension_paths: Vec::new(),
+            proxy_forwarder: None,
             trim_memory: false,
             language: None,
             user_agent: None,
@@ -333,6 +424,7 @@ mod tests {
             window_size: None,
             webrtc_proxy_only: false,
             disable_webrtc: false,
+            proxy_enabled: false,
             env: Vec::new(),
             debug_port: None,
         };
@@ -348,12 +440,14 @@ mod tests {
             user_data_dir: "/tmp/mbm/p1".into(),
             proxy_server: None,
             extension_paths: Vec::new(),
+            proxy_forwarder: None,
             language: None,
             user_agent: None,
             startup_url: None,
             window_size: None,
             webrtc_proxy_only: false,
             disable_webrtc: false,
+            proxy_enabled: false,
             env: Vec::new(),
             debug_port: None,
             trim_memory: false,
@@ -410,4 +504,47 @@ mod tests {
         assert!(features.contains("DisableLoadExtensionCommandLineSwitch"));
         assert!(features.contains("MediaRouter"));
     }
+
+    #[test]
+    fn scrub_removes_extension_proxy_config_but_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("mbm-scrub-test-{}", std::process::id()));
+        let default = dir.join("Default");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(
+            default.join("Preferences"),
+            r#"{"extensions":{"settings":{"extid":{"preferences":{"proxy":{"mode":"fixed_servers","server":"th.decodo.com:30001"},"other":1}},"other-ext":{"preferences":{"theme":2}}}},"profile":{"name":"x"}}"#,
+        )
+        .unwrap();
+
+        scrub_stale_proxy_prefs(&dir);
+
+        let prefs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(default.join("Preferences")).unwrap())
+                .unwrap();
+        let ext_prefs = &prefs["extensions"]["settings"]["extid"]["preferences"];
+        assert!(ext_prefs.get("proxy").is_none(), "stale proxy must be gone");
+        assert_eq!(ext_prefs["other"], 1, "unrelated ext prefs must survive");
+        assert_eq!(prefs["extensions"]["settings"]["other-ext"]["preferences"]["theme"], 2);
+        assert_eq!(prefs["profile"]["name"], "x", "unrelated top-level keys must survive");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scrub_is_a_no_op_without_preferences_or_proxy_entries() {
+        let missing = std::env::temp_dir().join(format!("mbm-scrub-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        scrub_stale_proxy_prefs(&missing); // must not panic, must not create anything
+        assert!(!missing.exists());
+
+        let dir = std::env::temp_dir().join(format!("mbm-scrub-clean-{}", std::process::id()));
+        let default = dir.join("Default");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(default.join("Preferences"), r#"{"profile":{"name":"x"}}"#).unwrap();
+        let before = std::fs::read(default.join("Preferences")).unwrap();
+        scrub_stale_proxy_prefs(&dir);
+        assert_eq!(before, std::fs::read(default.join("Preferences")).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
 }

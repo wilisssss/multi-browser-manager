@@ -45,7 +45,7 @@ export function ProfileForm({ profile, proxies, folders, defaultFolderId, defaul
   const [geoLat, setGeoLat] = useState<number | "">(fp?.geolocation?.latitude ?? "");
   const [geoLon, setGeoLon] = useState<number | "">(fp?.geolocation?.longitude ?? "");
   const [fontsText, setFontsText] = useState((fp?.fonts ?? []).join(", "));
-  const [disableWebRTC, setDisableWebRTC] = useState(fp?.disableWebRTC ?? false);
+  const [disableWebrtc, setDisableWebrtc] = useState(fp?.disableWebrtc ?? false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -101,8 +101,7 @@ export function ProfileForm({ profile, proxies, folders, defaultFolderId, defaul
       geolocation: hasGeo ? { latitude: Number(geoLat), longitude: Number(geoLon) } : null,
       fonts: fonts.length > 0 ? fonts : null,
       screen: screen === "invalid" ? null : screen,
-      // Only sent when on: the backend field is a plain bool, not an Option.
-      ...(disableWebRTC ? { disableWebRTC: true } : {}),
+      disableWebrtc,
     };
     const empty = Object.values(fp).every((v) => v === null);
     return empty ? null : fp;
@@ -304,8 +303,8 @@ export function ProfileForm({ profile, proxies, folders, defaultFolderId, defaul
               <label className="col-span-2 flex items-start gap-2 text-xs font-medium text-neutral-600 dark:text-neutral-300">
                 <input
                   type="checkbox"
-                  checked={disableWebRTC}
-                  onChange={(e) => setDisableWebRTC(e.target.checked)}
+                  checked={disableWebrtc}
+                  onChange={(e) => setDisableWebrtc(e.target.checked)}
                   className="mt-0.5 h-4 w-4 accent-blue-600"
                 />
                 <span>

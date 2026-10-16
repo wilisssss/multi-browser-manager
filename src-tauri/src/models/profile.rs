@@ -148,15 +148,105 @@ pub struct UpdateProfileInput {
     pub name: Option<String>,
     pub browser_type: Option<String>,
     /// Double-Option semantics: absent = keep current, null = unassign,
-    /// value = assign. (JSON can't express this with a single Option.)
+    /// value = assign. Plain serde maps JSON `null` to the outer `None`,
+    /// which would make "clear" indistinguishable from "keep" — hence the
+    /// `double_option` deserializer below.
+    #[serde(default, deserialize_with = "double_option")]
     pub proxy_id: Option<Option<String>>,
     /// Same semantics: absent = keep, null = clear.
+    #[serde(default, deserialize_with = "double_option")]
     pub notes: Option<Option<String>>,
     pub restart_on_crash: Option<bool>,
     /// Same double-Option semantics: absent = keep, null = unfile, value = move.
+    #[serde(default, deserialize_with = "double_option")]
     pub folder_id: Option<Option<String>>,
     /// Absent = keep, null = clear all overrides, value = replace.
+    #[serde(default, deserialize_with = "double_option")]
     pub fingerprint: Option<Option<Fingerprint>>,
     /// Absent = keep, null = clear, value = replace.
+    #[serde(default, deserialize_with = "double_option")]
     pub startup_url: Option<Option<String>>,
+}
+
+/// Turns an explicit JSON `null` into `Some(None)` so a field can be cleared.
+/// Without it, `Option<Option<T>>` reads `null` as `None` — the same as an
+/// absent field — and "No proxy" (or any cleared field) silently keeps the
+/// old value. An absent field never reaches this: `#[serde(default)]` applies.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The edit form's checkbox must survive the JSON round trip. The field
+    /// name is serde's camelCase (`disableWebrtc`) — a key spelled
+    /// differently (e.g. `disableWebRTC`) is silently ignored on
+    /// deserialize, so a checked box would come back unchecked.
+    #[test]
+    fn disable_webrtc_roundtrips_as_camel_case() {
+        let fp: Fingerprint =
+            serde_json::from_str(r#"{"userAgent":"u","disableWebrtc":true}"#).unwrap();
+        assert!(fp.disable_webrtc, "disableWebrtc:true must deserialize to true");
+
+        let out = serde_json::to_string(&fp).unwrap();
+        assert!(out.contains(r#""disableWebrtc":true"#), "serialize must emit disableWebrtc: {out}");
+    }
+
+    /// The exact payload the edit form sends when the user picks "No proxy":
+    /// every cleared field arrives as an explicit null and must actually
+    /// clear, not fall through to "keep the old value".
+    #[test]
+    fn explicit_null_clears_and_absent_keeps() {
+        let keep: UpdateProfileInput = serde_json::from_str("{}").unwrap();
+        assert!(keep.proxy_id.is_none(), "absent = keep current");
+
+        let clear: UpdateProfileInput =
+            serde_json::from_str(r#"{"proxyId": null}"#).unwrap();
+        assert_eq!(clear.proxy_id, Some(None), "explicit null = clear");
+
+        let set: UpdateProfileInput =
+            serde_json::from_str(r#"{"proxyId": "abc"}"#).unwrap();
+        assert_eq!(set.proxy_id, Some(Some("abc".into())));
+    }
+
+    #[test]
+    fn form_payload_with_all_fields_cleared_still_parses() {
+        let payload = r#"{
+            "name": "Utama",
+            "browserType": "chromium",
+            "proxyId": null,
+            "notes": null,
+            "restartOnCrash": false,
+            "folderId": null,
+            "fingerprint": null,
+            "startupUrl": null
+        }"#;
+        let input: UpdateProfileInput = serde_json::from_str(payload).unwrap();
+        assert_eq!(input.proxy_id, Some(None));
+        assert_eq!(input.notes, Some(None));
+        assert_eq!(input.folder_id, Some(None));
+        assert_eq!(input.fingerprint, Some(None));
+        assert_eq!(input.startup_url, Some(None));
+        assert_eq!(input.restart_on_crash, Some(false));
+        assert_eq!(input.name.as_deref(), Some("Utama"));
+    }
+
+    #[test]
+    fn form_payload_with_values_keeps_them() {
+        let payload = r#"{
+            "proxyId": "f08a2adf-c52d-4adb-a6a7-07f0603ad6f0",
+            "startupUrl": "https://myip.link"
+        }"#;
+        let input: UpdateProfileInput = serde_json::from_str(payload).unwrap();
+        assert_eq!(input.proxy_id, Some(Some("f08a2adf-c52d-4adb-a6a7-07f0603ad6f0".into())));
+        assert_eq!(input.startup_url, Some(Some("https://myip.link".into())));
+        // Untouched fields stay "keep".
+        assert!(input.name.is_none() && input.fingerprint.is_none());
+    }
 }

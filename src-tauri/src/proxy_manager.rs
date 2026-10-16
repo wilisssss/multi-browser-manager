@@ -69,13 +69,27 @@ pub fn generate_auth_proxy_extension(
     std::fs::create_dir_all(&scripts)?;
 
     // Note: never log credential material. Values go into the generated file only.
+    // The SW script filename must change whenever the content is regenerated:
+    // MV3 service workers are served from Chromium's ScriptCache keyed by URL,
+    // so a same-named script can keep running its OLD cached version after the
+    // file on disk is replaced (stale proxy config resurrection — HTTPS through
+    // a long-gone proxy fails with ERR_TUNNEL_CONNECTION_FAILED). A timestamped
+    // name forces Chromium to fetch the fresh script on every generation.
+    let script_name = format!(
+        "background-{}.js",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
+    );
+
     let manifest = serde_json::json!({
         "manifest_version": 3,
         "name": "MBM Proxy Auth",
         "version": "1.0.0",
         "permissions": ["proxy", "webRequest", "webRequestAuthProvider"],
         "host_permissions": ["<all_urls>"],
-        "background": { "service_worker": "background.js" }
+        "background": { "service_worker": script_name.clone() }
     });
 
     // Map our protocol names to chrome.proxy scheme values.
@@ -107,17 +121,32 @@ const PROXY = {{
 
 chrome.proxy.settings.set({{ value: PROXY, scope: "regular" }}, () => {{}});
 
+// MV3 service workers are event-driven and do NOT run at browser startup
+// unless an event wakes them. Without this listener, a stale chrome.proxy
+// config persisted in the profile's Preferences from a previous launch
+// (e.g. after replacing the proxy) stays in effect — HTTPS through the old,
+// dead proxy fails with ERR_TUNNEL_CONNECTION_FAILED. onStartup wakes the
+// worker on every browser launch so the current config is always re-applied.
+chrome.runtime.onStartup.addListener(() => {{
+  chrome.proxy.settings.set({{ value: PROXY, scope: "regular" }}, () => {{}});
+}});
+
+// Synchronous "blocking" auth — allowed in MV3 for onAuthRequired with the
+// webRequestAuthProvider permission. The previous asyncBlocking variant did
+// not reliably answer proxy challenges (HTTPS CONNECT tunnels failed with
+// ERR_TUNNEL_CONNECTION_FAILED and repeated unauthenticated hits could get
+// the session rate-limited by the gateway).
 chrome.webRequest.onAuthRequired.addListener(
-  (details, asyncCallback) => {{
-    asyncCallback({{
+  (details) => {{
+    return {{
       authCredentials: {{
         username: {username_js},
         password: {password_js}
       }}
-    }});
+    }};
   }},
   {{ urls: ["<all_urls>"] }},
-  ["asyncBlocking"]
+  ["blocking"]
 );
 "#,
         scheme = scheme,
@@ -128,7 +157,18 @@ chrome.webRequest.onAuthRequired.addListener(
     );
 
     write_private_file(&dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
-    write_private_file(&dir.join("background.js"), background)?;
+    write_private_file(&dir.join(&script_name), background)?;
+    // Remove scripts from previous generations so old credentials/configs
+    // never linger on disk.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("background") && name != script_name {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 
     Ok(dir)
 }
@@ -358,6 +398,22 @@ pub fn ensure_valid_protocol(p: &str) -> AppResult<()> {
 mod tests {
     use super::*;
 
+    /// The SW script filename is timestamped per generation — locate it.
+    fn script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        let mut scripts: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("background"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(scripts.len(), 1, "exactly one SW script expected");
+        scripts.pop().unwrap()
+    }
+
     #[test]
     fn generates_valid_extension_files() {
         let dir = generate_auth_proxy_extension(
@@ -370,7 +426,7 @@ mod tests {
         )
         .expect("generate extension");
 
-        let bg = std::fs::read_to_string(dir.join("background.js")).unwrap();
+        let bg = std::fs::read_to_string(script_path(&dir)).unwrap();
         assert!(bg.contains(r#"host: "proxy.example.com""#));
         assert!(bg.contains(r#"port: 8080"#));
         assert!(bg.contains(r#"scheme: "http""#));
@@ -386,7 +442,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join("background.js")).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(script_path(&dir)).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "background.js must be 0600");
             let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(dir_mode, 0o700, "extension dir must be 0700");
@@ -408,7 +464,7 @@ mod tests {
             "p\u{7}\"ss\n\\w",
         )
         .expect("generate extension");
-        let bg = std::fs::read_to_string(dir.join("background.js")).unwrap();
+        let bg = std::fs::read_to_string(script_path(&dir)).unwrap();
         // serde_json escapes these; the file must remain parseable as JS
         // literals (no raw control bytes in the string literals).
         assert!(!bg.contains("p\u{7}"));

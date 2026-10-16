@@ -48,6 +48,11 @@ INFO
 
 mkdir -p "$OUT_DIR"
 PKG="$OUT_DIR/$NAME-$VERSION-$PKGREL-x86_64.pkg.tar.zst"
+
+# Hapus paket lama (semua varian versi) supaya tidak ada file build basi yang
+# bisa salah dipasang — hasil di folder ini selalu build terbaru saja.
+rm -f "$OUT_DIR"/"$NAME"-*-x86_64.pkg.tar.zst
+
 tar -C "$STAGE" --owner=0 --group=0 --numeric-owner \
   --use-compress-program="zstd -19 -T0" -cf "$PKG" .PKGINFO usr
 echo "Built $PKG"

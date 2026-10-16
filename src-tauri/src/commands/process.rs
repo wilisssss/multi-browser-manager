@@ -78,6 +78,9 @@ fn build_launch_spec_blocking(
 ) -> AppResult<launcher::LaunchSpec> {
     let mut extension_paths: Vec<String> = Vec::new();
     let mut proxy_timezone: Option<String> = None;
+    // Set when the profile uses an authenticated proxy: the browser then
+    // points at the local forwarder (port filled in at spawn time).
+    let mut proxy_forwarder: Option<crate::browser::proxy_forwarder::UpstreamConfig> = None;
     let proxy_server_set = proxy_row.is_some();
     let (proxy_server, proxy_extension) = match proxy_row {
         None => (None, None),
@@ -101,15 +104,19 @@ fn build_launch_spec_blocking(
             }
             match username {
                 Some(username) => {
-                    let ext = proxy_manager::generate_auth_proxy_extension(
-                        &profile.id,
-                        &protocol,
-                        &host,
-                        port,
-                        &username,
-                        password.as_deref().unwrap_or(""),
-                    )?;
-                    (None, Some(ext.to_string_lossy().to_string()))
+                    // Route through the local forwarder instead of loading an
+                    // auth extension: MV3 extension auth cannot reliably wake
+                    // a sleeping service worker, so a 407 would silently kill
+                    // connectivity. The forwarder injects credentials before
+                    // anything leaves the machine.
+                    proxy_forwarder = Some(crate::browser::proxy_forwarder::UpstreamConfig {
+                        protocol: protocol,
+                        host: host,
+                        port: port as u16,
+                        username: username,
+                        password: password.unwrap_or_default(),
+                    });
+                    (None, None)
                 }
                 None => (Some(format!("{protocol}://{host}:{port}")), None),
             }
@@ -158,17 +165,27 @@ fn build_launch_spec_blocking(
         let _ = std::fs::remove_file(user_dir.join("SingletonLock"));
     }
 
+    // The proxy extension persists its chrome.proxy config in the profile's
+    // Preferences and Chromium keeps honouring it — outranking even
+    // command-line proxy flags — after the extension is gone, so a removed or
+    // replaced proxy would silently stay in effect. Scrub it here, while the
+    // browser is guaranteed to be stopped; a launch that does use the proxy
+    // extension lets it rewrite its config.
+    launcher::scrub_stale_proxy_prefs(user_dir);
+
     Ok(launcher::LaunchSpec {
         executable_path,
         user_data_dir: profile.user_data_dir.clone(),
         proxy_server,
         extension_paths,
+        proxy_forwarder,
         trim_memory,
         language: fingerprint.language.clone(),
         user_agent: fingerprint.user_agent.clone(),
         startup_url: profile.startup_url.clone(),
         window_size: phone,
         disable_webrtc: fingerprint.disable_webrtc,
+        proxy_enabled: proxy_server_set,
         webrtc_proxy_only: proxy_server_set,
         env: fingerprint
             .timezone
@@ -343,6 +360,26 @@ async fn launch_locked(
         }
     };
 
+    // 2.5) Authenticated proxy → start the local forwarder and point the
+    // browser at it. No credentials ever reach the browser process.
+    let mut spec = spec;
+    let mut forwarder_guard = None;
+    if let Some(upstream) = spec.proxy_forwarder.take() {
+        match crate::browser::proxy_forwarder::spawn(upstream).await {
+            Ok(guard) => {
+                spec.proxy_server = Some(format!("http://127.0.0.1:{}", guard.local_port));
+                forwarder_guard = Some(guard);
+            }
+            Err(e) => {
+                return LaunchResult {
+                    profile_id,
+                    success: false,
+                    message: format!("Failed to start local proxy forwarder: {e}"),
+                }
+            }
+        }
+    }
+
     let plan = match cdp_plan(&profile, &spec) {
         Ok(plan) => plan,
         Err(e) => return LaunchResult { profile_id, success: false, message: e.to_string() },
@@ -382,6 +419,9 @@ async fn launch_locked(
         profile_id.clone(),
         RunningProc { pid, stop_tx: stop_tx.clone(), done_rx },
     );
+    if let Some(guard) = forwarder_guard {
+        state.proxy_forwarders.lock().await.insert(profile_id.clone(), guard);
+    }
 
     let now = chrono::Utc::now().timestamp();
     let db_result: AppResult<()> = match db_lock(&state) {
@@ -456,24 +496,22 @@ async fn supervise(
     let state = app.state::<AppState>();
     let mut intentional_stop = false;
 
-    let wait_result = loop {
-        tokio::select! {
-            result = child.wait() => break result,
-            _ = stop_rx.recv() => {
-                intentional_stop = true;
-                // Graceful shutdown first: SIGTERM (Unix) / window-close
-                // request (Windows) lets Chromium flush session data; a hard
-                // kill causes the "Restore pages?" bubble on next launch.
-                send_signal(child.id().unwrap_or(0), "TERM").await;
-                let grace = std::time::Duration::from_secs(STOP_TIMEOUT_SECS);
-                match tokio::time::timeout(grace, child.wait()).await {
-                    Ok(result) => break result,
-                    Err(_) => {
-                        // Escalate: in-process kill via the owned handle —
-                        // cross-platform, no signal subprocesses.
-                        let _ = child.start_kill();
-                        break child.wait().await;
-                    }
+    let wait_result = tokio::select! {
+        result = child.wait() => result,
+        _ = stop_rx.recv() => {
+            intentional_stop = true;
+            // Graceful shutdown first: SIGTERM (Unix) / window-close
+            // request (Windows) lets Chromium flush session data; a hard
+            // kill causes the "Restore pages?" bubble on next launch.
+            send_signal(child.id().unwrap_or(0), "TERM").await;
+            let grace = std::time::Duration::from_secs(STOP_TIMEOUT_SECS);
+            match tokio::time::timeout(grace, child.wait()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Escalate: in-process kill via the owned handle —
+                    // cross-platform, no signal subprocesses.
+                    let _ = child.start_kill();
+                    child.wait().await
                 }
             }
         }
@@ -507,6 +545,12 @@ async fn supervise(
         }
     }
     proxy_manager::cleanup_extension(&profile_id);
+    // Stop the profile's local proxy forwarder (if any) — the browser is gone.
+    state
+        .proxy_forwarders
+        .lock()
+        .await
+        .remove(&profile_id); // Drop runs shutdown()
     let _ = app.emit("profile-stopped", &profile_id);
     crate::sync::after_profile_change(&app, &profile_id);
 

@@ -187,6 +187,9 @@ pub struct AppState {
     /// CPU-usage baselines for the resource panel (F2): pid →
     /// (total cpu ticks at last sample, when it was taken).
     pub usage_samples: Arc<Mutex<HashMap<u32, (u64, std::time::Instant)>>>,
+    /// Local proxy forwarders, one per running profile that uses an
+    /// authenticated proxy. Stopped when the profile's browser exits.
+    pub proxy_forwarders: Arc<AsyncMutex<HashMap<String, crate::browser::proxy_forwarder::ForwarderGuard>>>,
 }
 
 fn app_data_root() -> PathBuf {
@@ -334,6 +337,7 @@ pub fn run() {
                 browser_cache: Arc::new(Mutex::new(HashMap::new())),
                 profile_locks: Arc::new(Mutex::new(HashMap::new())),
                 usage_samples: Arc::new(Mutex::new(HashMap::new())),
+                proxy_forwarders: Arc::new(AsyncMutex::new(HashMap::new())),
             });
 
             // Belt and braces: strip client-side decorations at runtime too

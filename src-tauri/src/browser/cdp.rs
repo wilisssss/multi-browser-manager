@@ -12,17 +12,25 @@
 //! the lifetime of the process.
 
 use crate::error::{AppError, AppResult};
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::TcpListener;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// The browser WebSocket, which multiplexes per-target sessions.
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// One message from the browser: a reply to one of our commands, or an event.
+enum Frame {
+    Reply(u64, Value),
+    Event(Value),
+}
 
 /// Everything applied to a page right after the browser starts.
 #[derive(Debug, Clone, Default)]
@@ -64,32 +72,26 @@ pub fn pick_debug_port() -> AppResult<u16> {
 /// configured as it appears.
 pub async fn apply(port: u16, plan: &Plan) -> AppResult<()> {
     let ws_url = wait_for_browser_ws(port).await?;
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+    let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .map_err(|e| AppError::validation(format!("CDP connect failed: {e}")))?;
-    let mut id: u64 = 0;
+    let (sink, stream) = ws.split();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(pump(stream, tx));
+    let mut cdp = Connection { sink, rx, next_id: 0, pending: VecDeque::new() };
 
     // Attach to the pages that already exist and to every page opened later.
     // `waitForDebuggerOnStart` holds a new page until its overrides are applied,
     // so a tab never paints with the host's default viewport first.
     let auto_attach = json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true });
-    send_command(&mut ws, &mut id, None, "Target.setAutoAttach", auto_attach).await?;
+    cdp.send(None, "Target.setAutoAttach", auto_attach).await?;
 
     let commands = page_identity_commands(plan);
     let reload_initial = plan.init_script.is_some();
     // Guards against configuring the same page twice if it re-attaches.
     let mut configured: HashSet<String> = HashSet::new();
 
-    while let Some(frame) = ws.next().await {
-        let text = match frame {
-            Ok(Message::Text(text)) => text,
-            Ok(_) => continue,
-            Err(_) => break,
-        };
-        let event: Value = match serde_json::from_str(&text) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+    while let Some(event) = cdp.next_event().await {
         if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
             continue;
         }
@@ -108,7 +110,8 @@ pub async fn apply(port: u16, plan: &Plan) -> AppResult<()> {
         // Non-page targets (services, browser chrome) only need resuming.
         if target.get("type").and_then(Value::as_str) != Some("page") {
             if waiting {
-                let _ = send_command(&mut ws, &mut id, Some(session), "Runtime.runIfWaitingForDebugger", json!({}))
+                let _ = cdp
+                    .send(Some(session), "Runtime.runIfWaitingForDebugger", json!({}))
                     .await;
             }
             continue;
@@ -120,7 +123,7 @@ pub async fn apply(port: u16, plan: &Plan) -> AppResult<()> {
         // Fresh session for this page: (re)apply the overrides.
         if configured.insert(target_id.to_string()) {
             for (method, params) in &commands {
-                if let Err(e) = send_command(&mut ws, &mut id, Some(session), method, params.clone()).await {
+                if let Err(e) = cdp.send(Some(session), method, params.clone()).await {
                     eprintln!("mbm: CDP {method} failed: {e}");
                 }
             }
@@ -128,15 +131,104 @@ pub async fn apply(port: u16, plan: &Plan) -> AppResult<()> {
             // reloaded for it to take effect. A held page already ran it, so it
             // is left alone (no visible reload on a fresh tab).
             if reload_initial && !waiting {
-                let _ = send_command(&mut ws, &mut id, Some(session), "Page.reload", json!({})).await;
+                let _ = cdp.send(Some(session), "Page.reload", json!({})).await;
             }
         }
         if waiting {
-            let _ = send_command(&mut ws, &mut id, Some(session), "Runtime.runIfWaitingForDebugger", json!({}))
+            let _ = cdp
+                .send(Some(session), "Runtime.runIfWaitingForDebugger", json!({}))
                 .await;
         }
     }
     Ok(())
+}
+
+/// Forwards every message the browser sends into `tx`, keeping replies and
+/// events on separate tracks. Chromium delivers `attachedToTarget` for the
+/// pages that already exist *before* the reply to `setAutoAttach`, so anything
+/// waiting for a reply must queue those events, never drop them.
+async fn pump(mut stream: SplitStream<Ws>, tx: mpsc::UnboundedSender<Frame>) {
+    while let Some(frame) = stream.next().await {
+        let parsed = match frame {
+            Ok(Message::Text(text)) => match serde_json::from_str::<Value>(&text) {
+                Ok(value) => match value.get("id").and_then(Value::as_u64) {
+                    Some(id) => Frame::Reply(id, value),
+                    None if value.get("method").is_some() => Frame::Event(value),
+                    None => continue,
+                },
+                Err(_) => continue,
+            },
+            Ok(_) => continue,
+            Err(_) => break,
+        };
+        if tx.send(parsed).is_err() {
+            break;
+        }
+    }
+}
+
+/// The write half plus the event stream. Events that arrive while a command
+/// reply is awaited are queued in `pending`, not dropped.
+struct Connection {
+    sink: SplitSink<Ws, Message>,
+    rx: mpsc::UnboundedReceiver<Frame>,
+    next_id: u64,
+    pending: VecDeque<Value>,
+}
+
+impl Connection {
+    /// Sends one command, optionally into a flat session, and waits for its
+    /// reply, queueing any events seen on the way.
+    async fn send(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> AppResult<Value> {
+        self.next_id += 1;
+        let cmd_id = self.next_id;
+        let mut message = json!({ "id": cmd_id, "method": method, "params": params });
+        if let Some(session) = session {
+            message["sessionId"] = json!(session);
+        }
+        self.sink
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .map_err(|e| AppError::validation(format!("CDP send failed: {e}")))?;
+
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), self.rx.recv())
+                .await
+                .map_err(|_| AppError::validation("CDP command timed out"))?;
+            match frame {
+                Some(Frame::Reply(id, reply)) if id == cmd_id => {
+                    if let Some(err) = reply.get("error") {
+                        return Err(AppError::validation(format!("CDP error: {err}")));
+                    }
+                    return Ok(reply);
+                }
+                Some(Frame::Reply(..)) => {}
+                // This is what lost the startup tab: its attach event lands
+                // here while `setAutoAttach` is still awaiting its reply.
+                Some(Frame::Event(event)) => self.pending.push_back(event),
+                None => return Err(AppError::validation("CDP connection closed")),
+            }
+        }
+    }
+
+    /// The next event to handle: queued ones first, then fresh ones.
+    async fn next_event(&mut self) -> Option<Value> {
+        if let Some(event) = self.pending.pop_front() {
+            return Some(event);
+        }
+        loop {
+            match self.rx.recv().await {
+                Some(Frame::Event(event)) => return Some(event),
+                Some(Frame::Reply(..)) => {}
+                None => return None,
+            }
+        }
+    }
 }
 
 /// The per-page overrides, in the order they must be applied: register the init
@@ -196,45 +288,6 @@ fn page_identity_commands(plan: &Plan) -> Vec<(String, Value)> {
     }
 
     commands
-}
-
-/// Sends one command, optionally into a flat session, and waits for its reply.
-/// Events received while waiting are skipped.
-async fn send_command(
-    ws: &mut Ws,
-    id: &mut u64,
-    session: Option<&str>,
-    method: &str,
-    params: Value,
-) -> AppResult<Value> {
-    *id += 1;
-    let cmd_id = *id;
-    let mut message = json!({ "id": cmd_id, "method": method, "params": params });
-    if let Some(session) = session {
-        message["sessionId"] = json!(session);
-    }
-    ws.send(Message::Text(message.to_string().into()))
-        .await
-        .map_err(|e| AppError::validation(format!("CDP send failed: {e}")))?;
-
-    loop {
-        let frame = tokio::time::timeout(Duration::from_secs(10), ws.next())
-            .await
-            .map_err(|_| AppError::validation("CDP command timed out"))?;
-        match frame {
-            Some(Ok(Message::Text(text))) => {
-                let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                if reply.get("id").and_then(Value::as_u64) == Some(cmd_id) {
-                    if let Some(err) = reply.get("error") {
-                        return Err(AppError::validation(format!("CDP error: {err}")));
-                    }
-                    return Ok(reply);
-                }
-            }
-            Some(Ok(_)) => {}
-            _ => return Err(AppError::validation("CDP connection closed")),
-        }
-    }
 }
 
 /// Polls `/json/version` until the browser exposes its debugger WebSocket.
