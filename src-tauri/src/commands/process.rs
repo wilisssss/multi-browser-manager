@@ -213,15 +213,18 @@ fn cdp_plan(profile: &Profile, spec: &launcher::LaunchSpec) -> AppResult<crate::
             full_version: id.full_version,
         }
     });
-    let init_script = crate::browser::fingerprint::script_with_seed(
+    let init_script = crate::browser::fingerprint::script_with_phone_dpr(
         &fp,
         crate::browser::fingerprint::profile_seed(&profile.id),
+        phone.map(|(w, _)| crate::browser::user_agent::phone_dpr_for_width(w)),
     )?;
     Ok(Plan {
         init_script: Some(init_script),
         user_agent: spec.user_agent.clone(),
         client_hints,
         viewport: phone,
+        device_scale_factor: phone
+            .map(|(w, _)| crate::browser::user_agent::phone_dpr_for_width(w)),
         mobile: phone.is_some(),
         timezone: spec.env.iter().find(|(k, _)| k == "TZ").map(|(_, v)| v.clone()),
         locale: fp.language.clone(),

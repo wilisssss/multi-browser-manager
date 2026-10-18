@@ -43,6 +43,9 @@ pub struct Plan {
     /// Viewport `(width, height)`, applied as a mobile-sized device when `mobile`.
     pub viewport: Option<(u32, u32)>,
     pub mobile: bool,
+    /// Device pixel ratio for the emulated screen. Phones report a density
+    /// bucket (2.5–3), never the host's 1, so it is derived per screen width.
+    pub device_scale_factor: Option<f64>,
     pub timezone: Option<String>,
     pub locale: Option<String>,
 }
@@ -246,11 +249,20 @@ fn page_identity_commands(plan: &Plan) -> Vec<(String, Value)> {
         ));
     }
     if let Some((w, h)) = plan.viewport {
-        commands.push((
-            "Emulation.setDeviceMetricsOverride".to_string(),
-            json!({ "width": w, "height": h, "deviceScaleFactor": 1, "mobile": plan.mobile,
-                    "screenWidth": w, "screenHeight": h }),
-        ));
+        let mut metrics = json!({ "width": w, "height": h, "deviceScaleFactor": plan.device_scale_factor.unwrap_or(1.0), "mobile": plan.mobile,
+                "screenWidth": w, "screenHeight": h });
+        if plan.mobile {
+            // Phones are portrait and touch-first; without these a page sees a
+            // landscape, mouse-driven desktop.
+            metrics["screenOrientation"] = json!({ "type": "portraitPrimary", "angle": 0 });
+        }
+        commands.push(("Emulation.setDeviceMetricsOverride".to_string(), metrics));
+        if plan.mobile {
+            commands.push((
+                "Emulation.setTouchEmulationEnabled".to_string(),
+                json!({ "enabled": true, "maxTouchPoints": 5 }),
+            ));
+        }
     }
     if let Some(ua) = &plan.user_agent {
         let mut params = json!({ "userAgent": ua });
@@ -270,6 +282,7 @@ fn page_identity_commands(plan: &Plan) -> Vec<(String, Value)> {
                 "mobile": hints.mobile,
                 "bitness": "64",
                 "wow64": false,
+                "formFactors": if hints.mobile { vec!["Mobile"] } else { vec!["Desktop"] },
             });
         }
         commands.push(("Emulation.setUserAgentOverride".to_string(), params));
@@ -326,6 +339,30 @@ mod tests {
         assert_eq!(params["screenWidth"], 412);
         assert_eq!(params["screenHeight"], 915);
         assert_eq!(params["mobile"], true);
+        // Portrait orientation and touch input, like a real phone.
+        assert_eq!(params["screenOrientation"]["type"], "portraitPrimary");
+        let (_, touch) = commands
+            .iter()
+            .find(|(m, _)| m == "Emulation.setTouchEmulationEnabled")
+            .expect("touch emulation for phones");
+        assert_eq!(touch["enabled"], true);
+        assert_eq!(touch["maxTouchPoints"], 5);
+    }
+
+    #[test]
+    fn phone_device_scale_factor_comes_from_the_plan() {
+        let plan = Plan {
+            viewport: Some((412, 915)),
+            mobile: true,
+            device_scale_factor: Some(2.625),
+            ..Default::default()
+        };
+        let commands = page_identity_commands(&plan);
+        let (_, params) = commands
+            .iter()
+            .find(|(m, _)| m == "Emulation.setDeviceMetricsOverride")
+            .unwrap();
+        assert_eq!(params["deviceScaleFactor"], 2.625);
     }
 
     #[test]
@@ -350,6 +387,7 @@ mod tests {
         assert_eq!(params["userAgentMetadata"]["platform"], "Android");
         assert_eq!(params["userAgentMetadata"]["mobile"], true);
         assert_eq!(params["userAgentMetadata"]["model"], "Pixel 10");
+        assert_eq!(params["userAgentMetadata"]["formFactors"], json!(["Mobile"]));
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //! Language also goes through a flag (see `launcher::build_args`) so the
 //! network layer and the JS layer agree.
 //!
-//! Limitation: this is best-effort identity shaping, not undetectable. User
-//! agent client hints and some canvas/WebGL signals are not fully covered.
+//! Limitation: this is best-effort identity shaping, not undetectable. TLS
+//! fingerprints, font metrics and the raw WebGL parameter set still come from
+//! the host.
 
 use crate::error::AppResult;
 use crate::models::profile::{Fingerprint, Geolocation};
@@ -17,6 +18,18 @@ use serde_json::json;
 /// canvas noise. Every value is embedded as a JSON literal, so user input can
 /// never break out of the script.
 pub fn script_with_seed(fp: &Fingerprint, seed: u32) -> AppResult<String> {
+    script_with_phone_dpr(fp, seed, None)
+}
+
+/// Same as [`script_with_seed`], plus the device pixel ratio a phone preset
+/// should report. The engine's value carries the host's fractional display
+/// scale (`2.9999999`), which is not a density bucket a real phone reports, so
+/// the page gets the clean value instead.
+pub fn script_with_phone_dpr(
+    fp: &Fingerprint,
+    seed: u32,
+    phone_dpr: Option<f64>,
+) -> AppResult<String> {
     let mut parts: Vec<String> = Vec::new();
 
     parts.push(canvas_patch(seed));
@@ -50,6 +63,14 @@ pub fn script_with_seed(fp: &Fingerprint, seed: u32) -> AppResult<String> {
     }
     if let Some(screen) = &fp.screen {
         parts.push(screen_patch(screen.width, screen.height));
+    }
+    if let Some(dpr) = phone_dpr {
+        parts.push(format!(
+            // `devicePixelRatio` is an own accessor on the global object, so
+            // defining it on `Window.prototype` would be shadowed.
+            "define(window, 'devicePixelRatio', {});",
+            serde_json::to_string(&dpr)?
+        ));
     }
     if fp.disable_webrtc {
         parts.push(webrtc_patch());
@@ -104,7 +125,9 @@ fn canvas_patch(seed: u32) -> String {
 
 /// Client-identity patch derived from the chosen user agent: navigator.platform,
 /// maxTouchPoints and navigator.userAgentData (brands, mobile, platform and
-/// high-entropy values), so JS-side checks agree with the UA header.
+/// high-entropy values), so JS-side checks agree with the UA header. Android
+/// UAs also get phone-consistent hardware values (cores, memory, PDF viewer,
+/// TTS voices) and the device's GPU strings for the unmasked WebGL values.
 fn client_identity_patch(ua: &str) -> AppResult<String> {
     let id = UaIdentity::from_ua(ua);
     let touch = if id.mobile { 5 } else { 0 };
@@ -114,6 +137,11 @@ fn client_identity_patch(ua: &str) -> AppResult<String> {
             { "brand": "Google Chrome", "version": id.major },
             { "brand": "Not.A/Brand", "version": "8" }
         ],
+        "fullVersions": [
+            { "brand": "Chromium", "version": id.full_version },
+            { "brand": "Google Chrome", "version": id.full_version },
+            { "brand": "Not.A/Brand", "version": "8.0.0.0" }
+        ],
         "mobile": id.mobile,
         "platform": id.ua_platform,
         "navPlatform": id.nav_platform,
@@ -121,16 +149,18 @@ fn client_identity_patch(ua: &str) -> AppResult<String> {
         "architecture": id.architecture,
         "model": id.model,
         "uaFullVersion": id.full_version,
+        "formFactors": if id.mobile { ["Mobile"] } else { ["Desktop"] },
         "touchPoints": touch,
     });
-    Ok(format!(
+    let mut script = format!(
         "const UA_DATA = {data};\n\
          define(Navigator.prototype, 'platform', UA_DATA.navPlatform);\n\
          define(Navigator.prototype, 'maxTouchPoints', UA_DATA.touchPoints);\n\
          const uaHighEntropy = () => ({{\n\
            brands: UA_DATA.brands, mobile: UA_DATA.mobile, platform: UA_DATA.platform,\n\
            platformVersion: UA_DATA.platformVersion, architecture: UA_DATA.architecture,\n\
-           bitness: '64', model: UA_DATA.model, uaFullVersion: UA_DATA.uaFullVersion, wow64: false,\n\
+           bitness: '64', model: UA_DATA.model, uaFullVersion: UA_DATA.uaFullVersion,\n\
+           fullVersionList: UA_DATA.fullVersions, formFactors: UA_DATA.formFactors, wow64: false,\n\
          }});\n\
          define(Navigator.prototype, 'userAgentData', {{\n\
            brands: UA_DATA.brands,\n\
@@ -143,7 +173,96 @@ fn client_identity_patch(ua: &str) -> AppResult<String> {
              return Promise.resolve(out);\n\
            }},\n\
            toJSON() {{ return {{ brands: this.brands, mobile: this.mobile, platform: this.platform }}; }},\n\
-         }});"
+         }});",
+        data = data,
+    );
+    if id.mobile {
+        script.push_str(&mobile_device_patch(ua.contains("; wv)")));
+        if let Some((vendor, renderer)) = crate::browser::user_agent::phone_gpu_for_ua(ua) {
+            script.push_str(&webgl_gpu_patch(vendor, renderer)?);
+        }
+    }
+    Ok(script)
+}
+
+/// Desktop-Chrome hardware values that contradict a phone UA: core count,
+/// memory bucket, the fixed PDF-viewer plugin list (Android has no inline PDF
+/// viewer, so `plugins`/`mimeTypes` are empty and `pdfViewerEnabled` false),
+/// the TTS voice list (always populated on Android) and — for Chrome-style
+/// UAs, since WebView never ships it — Web Bluetooth.
+fn mobile_device_patch(webview: bool) -> String {
+    let mut js = "const emptyArrayLike = (Ctor) => {\n\
+       const arr = Object.create(Ctor && Ctor.prototype ? Ctor.prototype : Object.prototype);\n\
+       define(arr, 'length', 0);\n\
+       define(arr, 'item', () => null);\n\
+       define(arr, 'namedItem', () => null);\n\
+       return arr;\n\
+     };\n\
+     define(Navigator.prototype, 'hardwareConcurrency', 8);\n\
+     define(Navigator.prototype, 'deviceMemory', 8);\n\
+     define(Navigator.prototype, 'plugins', emptyArrayLike(window.PluginArray));\n\
+     define(Navigator.prototype, 'mimeTypes', emptyArrayLike(window.MimeTypeArray));\n\
+     define(Navigator.prototype, 'pdfViewerEnabled', false);\n\
+     if (window.speechSynthesis && window.SpeechSynthesisVoice) {\n\
+       try {\n\
+         const makeVoice = (v) => {\n\
+           const voice = Object.create(window.SpeechSynthesisVoice.prototype);\n\
+           for (const key of ['voiceURI', 'name', 'lang', 'localService', 'default']) define(voice, key, v[key]);\n\
+           return voice;\n\
+         };\n\
+         const VOICES = [\n\
+           { voiceURI: 'Google US English', name: 'Google US English', lang: 'en-US', localService: true, default: true },\n\
+           { voiceURI: 'Google Bahasa Indonesia', name: 'Google Bahasa Indonesia', lang: 'id-ID', localService: true, default: false },\n\
+         ].map(makeVoice);\n\
+         define(window.speechSynthesis, 'getVoices', () => VOICES);\n\
+       } catch (e) {}\n\
+     }"
+    .to_string();
+    if !webview {
+        js.push_str(bluetooth_patch());
+    }
+    js
+}
+
+/// Chrome for Android ships Web Bluetooth; Chromium on Linux has no
+/// `navigator.bluetooth` at all, so a Chrome-style Android UA gets a minimal
+/// stand-in with the shape feature probes look for.
+fn bluetooth_patch() -> &'static str {
+    "try {\n\
+       if (!navigator.bluetooth) {\n\
+         let bluetooth;\n\
+         if (window.Bluetooth) {\n\
+           try { bluetooth = new window.Bluetooth(); } catch (e) { bluetooth = Object.create(window.Bluetooth.prototype); }\n\
+         } else {\n\
+           const Bt = class Bluetooth extends EventTarget {};\n\
+           bluetooth = new Bt();\n\
+           define(window, 'Bluetooth', Bt);\n\
+         }\n\
+         define(bluetooth, 'getAvailability', () => Promise.resolve(true));\n\
+         define(bluetooth, 'getDevices', () => Promise.resolve([]));\n\
+         define(bluetooth, 'requestDevice', () => Promise.reject(new DOMException('User cancelled the request.', 'NotFoundError')));\n\
+         define(Navigator.prototype, 'bluetooth', bluetooth);\n\
+       }\n\
+     } catch (e) {}"
+}
+
+/// Answers the unmasked WebGL vendor/renderer enums with the device's real GPU
+/// instead of the host desktop's. The extension itself stays available, as on
+/// Android Chrome; only the two parameters are replaced.
+fn webgl_gpu_patch(vendor: &str, renderer: &str) -> AppResult<String> {
+    Ok(format!(
+        "const GPU = {{ vendor: {}, renderer: {} }};\n\
+         for (const Ctor of [window.WebGLRenderingContext, window.WebGL2RenderingContext]) {{\n\
+           if (!Ctor) continue;\n\
+           const origGetParameter = Ctor.prototype.getParameter;\n\
+           Ctor.prototype.getParameter = function (pname) {{\n\
+             if (pname === 0x9245) return GPU.vendor;\n\
+             if (pname === 0x9246) return GPU.renderer;\n\
+             return origGetParameter.call(this, pname);\n\
+           }};\n\
+         }}",
+        serde_json::to_string(vendor)?,
+        serde_json::to_string(renderer)?,
     ))
 }
 
@@ -389,6 +508,88 @@ mod tests {
         .unwrap();
         assert!(s.contains(r#""navPlatform":"Linux armv8l""#));
         assert!(s.contains("'userAgentData'"));
+    }
+
+    #[test]
+    fn android_ua_gets_phone_hardware_and_gpu_patches() {
+        let s = script_with_seed(
+            &Fingerprint {
+                user_agent: Some(
+                    "Mozilla/5.0 (Linux; Android 16; SM-S931B Build/BP2A.250605.031.A3; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/153.0.8010.36 Mobile Safari/537.36".into(),
+                ),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        assert!(s.contains("'hardwareConcurrency', 8"));
+        assert!(s.contains("'deviceMemory', 8"));
+        assert!(s.contains("'pdfViewerEnabled', false"));
+        assert!(s.contains("emptyArrayLike(window.PluginArray)"));
+        assert!(s.contains("SpeechSynthesisVoice"));
+        assert!(s.contains(r#""formFactors":["Mobile"]"#));
+        assert!(s.contains(r#""fullVersions""#));
+        assert!(s.contains(r#""Adreno (TM) 830""#));
+        // WebView does not ship Web Bluetooth.
+        assert!(!s.contains("getAvailability"));
+    }
+
+    #[test]
+    fn chrome_style_ua_gets_web_bluetooth() {
+        let s = script_with_seed(
+            &Fingerprint {
+                user_agent: Some(
+                    "Mozilla/5.0 (Linux; Android 15; V2408A Build/AP4A.250105.002) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.100 Mobile Safari/537.36".into(),
+                ),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        assert!(s.contains("'bluetooth'"));
+        assert!(s.contains("getAvailability"));
+    }
+
+    #[test]
+    fn desktop_ua_keeps_desktop_shaped_values() {
+        let s = script_with_seed(
+            &Fingerprint {
+                user_agent: Some(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36".into(),
+                ),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        assert!(!s.contains("hardwareConcurrency"));
+        assert!(!s.contains("pdfViewerEnabled"));
+        assert!(!s.contains("0x9245"));
+        assert!(s.contains(r#""formFactors":["Desktop"]"#));
+    }
+
+    #[test]
+    fn unknown_android_ua_skips_the_gpu_patch() {
+        let s = script_with_seed(
+            &Fingerprint {
+                user_agent: Some(
+                    "Mozilla/5.0 (Linux; Android 15; Some Phone) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36".into(),
+                ),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        assert!(s.contains("hardwareConcurrency"));
+        assert!(!s.contains("0x9245"));
+    }
+
+    #[test]
+    fn phone_script_reports_the_clean_device_pixel_ratio() {
+        let s = script_with_phone_dpr(&Fingerprint::default(), 0, Some(2.625)).unwrap();
+        assert!(s.contains("define(window, 'devicePixelRatio', 2.625);"));
+        let plain = script_with_seed(&Fingerprint::default(), 0).unwrap();
+        assert!(!plain.contains("devicePixelRatio"));
     }
 
     #[test]
