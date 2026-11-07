@@ -13,6 +13,7 @@ pub mod migrations {
         (9, include_str!("migrations/0009_startup_url.sql")),
         (10, include_str!("migrations/0010_drop_extra_args_stop_timeout.sql")),
         (11, include_str!("migrations/0011_drop_groups.sql")),
+        (12, include_str!("migrations/0012_proxy_test_history.sql")),
     ];
 }
 

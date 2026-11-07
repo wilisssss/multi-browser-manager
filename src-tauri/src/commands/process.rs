@@ -202,30 +202,45 @@ fn cdp_plan(profile: &Profile, spec: &launcher::LaunchSpec) -> AppResult<crate::
     use crate::browser::cdp::{ClientHints, Plan};
     let fp = profile.fingerprint.clone().unwrap_or_default();
     let phone = spec.window_size;
-    let client_hints = fp.user_agent.as_deref().map(|ua| {
-        let id = crate::browser::fingerprint::UaIdentity::from_ua(ua);
-        ClientHints {
+    let identity = fp
+        .user_agent
+        .as_deref()
+        .map(crate::browser::fingerprint::UaIdentity::from_ua);
+    // Only Chromium-based UAs may receive Client Hints metadata: Symbian
+    // WebKit, Firefox or Safari never send it, and an override with empty
+    // brand versions is worse than no override at all.
+    let client_hints = identity
+        .as_ref()
+        .filter(|id| !id.full_version.is_empty())
+        .map(|id| ClientHints {
             platform: id.ua_platform.to_string(),
-            platform_version: id.platform_version,
+            platform_version: id.platform_version.clone(),
             architecture: id.architecture.to_string(),
-            model: id.model,
+            model: id.model.clone(),
             mobile: id.mobile,
-            full_version: id.full_version,
-        }
+            full_version: id.full_version.clone(),
+        });
+    let dpr = phone.map(|(w, _)| {
+        crate::browser::user_agent::phone_dpr_for_ua(
+            fp.user_agent.as_deref().unwrap_or_default(),
+            w,
+        )
     });
     let init_script = crate::browser::fingerprint::script_with_phone_dpr(
         &fp,
         crate::browser::fingerprint::profile_seed(&profile.id),
-        phone.map(|(w, _)| crate::browser::user_agent::phone_dpr_for_width(w)),
+        dpr,
     )?;
     Ok(Plan {
         init_script: Some(init_script),
         user_agent: spec.user_agent.clone(),
         client_hints,
         viewport: phone,
-        device_scale_factor: phone
-            .map(|(w, _)| crate::browser::user_agent::phone_dpr_for_width(w)),
+        device_scale_factor: dpr,
         mobile: phone.is_some(),
+        // A keypad/stylus phone (Symbian) gets the phone viewport without
+        // touch emulation.
+        touch: phone.is_some() && identity.as_ref().is_some_and(|id| id.mobile),
         timezone: spec.env.iter().find(|(k, _)| k == "TZ").map(|(_, v)| v.clone()),
         locale: fp.language.clone(),
     })

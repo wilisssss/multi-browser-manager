@@ -14,13 +14,21 @@
 //! authenticated request — exit selection honors the username's filters and
 //! no 407 round-trip ever happens inside the browser.
 //!
+//! Supported upstreams: `http` and `https` (CONNECT/absolute-form over plain or
+//! TLS sockets respectively), `socks4`/`socks4a` (no authentication) and
+//! `socks5` (optional RFC 1929 user/password).
+//!
 //! Credentials live only in memory (never on disk, never in argv).
 
 use base64::Engine as _;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio_rustls::TlsConnector;
 
 /// Upstream proxy the forwarder relays to.
 #[derive(Debug, Clone)]
@@ -31,6 +39,46 @@ pub struct UpstreamConfig {
     pub port: u16,
     pub username: String,
     pub password: String,
+}
+
+/// A TCP socket to the upstream, optionally with TLS (HTTPS proxies).
+enum UpstreamStream {
+    Plain(TcpStream),
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl AsyncRead for UpstreamStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            UpstreamStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            UpstreamStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for UpstreamStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            UpstreamStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            UpstreamStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            UpstreamStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            UpstreamStream::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            UpstreamStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            UpstreamStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
 }
 
 /// Owns a running forwarder. Dropping it (or calling `shutdown`) stops the
@@ -110,9 +158,10 @@ async fn handle_conn(mut client: TcpStream, upstream: &UpstreamConfig) -> std::i
 /// HTTPS (and other tunneled) traffic: `CONNECT host:port` from the browser.
 async fn tunnel(client: &mut TcpStream, target: &str, up: &UpstreamConfig) -> std::io::Result<()> {
     let mut upstream = match up.protocol.as_str() {
-        "socks5" => socks5_connect(up, target).await?,
+        "socks5" => UpstreamStream::Plain(socks5_connect(up, target).await?),
+        "socks4" | "socks4a" => UpstreamStream::Plain(socks4_connect(up, target).await?),
         _ => {
-            let mut s = TcpStream::connect((up.host.as_str(), up.port)).await?;
+            let mut s = upstream_socket(up).await?;
             let req = format!(
                 "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: {auth}\r\nProxy-Connection: keep-alive\r\n\r\n",
                 auth = basic_auth(up),
@@ -147,9 +196,13 @@ async fn plain_http(
     let mut upstream = match up.protocol.as_str() {
         "socks5" => {
             let target = absolute_url_target(first_line)?;
-            socks5_connect(up, &target).await?
+            UpstreamStream::Plain(socks5_connect(up, &target).await?)
         }
-        _ => TcpStream::connect((up.host.as_str(), up.port)).await?,
+        "socks4" | "socks4a" => {
+            let target = absolute_url_target(first_line)?;
+            UpstreamStream::Plain(socks4_connect(up, &target).await?)
+        }
+        _ => upstream_socket(up).await?,
     };
 
     let auth = if up.protocol == "socks5" { None } else { Some(basic_auth(up)) };
@@ -178,20 +231,112 @@ async fn plain_http(
     Ok(())
 }
 
+fn log_err(msg: &str) {
+    eprintln!("mbm: {msg}");
+}
+
 fn basic_auth(up: &UpstreamConfig) -> String {
     let raw = format!("{}:{}", up.username, up.password);
     format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(raw.as_bytes()))
 }
 
-/// SOCKS5 (RFC 1928) connect with optional user/pass auth (RFC 1929).
-async fn socks5_connect(up: &UpstreamConfig, target: &str) -> std::io::Result<TcpStream> {
+/// Splits `host:port` (with or without bracketed IPv6) into its parts.
+fn split_host_port(target: &str) -> std::io::Result<(String, u16)> {
     let (host, port) = target
         .rsplit_once(':')
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad target"))?;
     let port: u16 = port.parse().map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "bad target port")
     })?;
-    let host = host.trim_matches(|c| c == '[' || c == ']');
+    Ok((host.trim_matches(|c| c == '[' || c == ']').to_string(), port))
+}
+
+/// Opens the upstream socket: TLS for `https` proxies, plain TCP otherwise.
+async fn upstream_socket(up: &UpstreamConfig) -> std::io::Result<UpstreamStream> {
+    if up.protocol == "https" {
+        return Ok(UpstreamStream::Tls(https_connect(up).await?));
+    }
+    Ok(UpstreamStream::Plain(
+        TcpStream::connect((up.host.as_str(), up.port)).await?,
+    ))
+}
+
+/// TLS to the proxy itself (an "https" proxy), with WebPKI roots.
+async fn https_connect(up: &UpstreamConfig) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    // Prefer the system trust store (corporate/self-signed proxy CAs the user
+    // or IT installed), falling back to the compiled-in public roots.
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = roots.add(cert);
+    }
+    if !native.errors.is_empty() {
+        log_err(&format!(
+            "could not load {} native CA certificate(s); using them if they parsed",
+            native.errors.len()
+        ));
+    }
+    if roots.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(std::sync::Arc::new(config));
+    let server_name = rustls::pki_types::ServerName::try_from(up.host.clone()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "proxy host is not a valid TLS server name")
+    })?;
+    let tcp = TcpStream::connect((up.host.as_str(), up.port)).await?;
+    connector.connect(server_name, tcp).await.map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("TLS to the proxy failed: {e}"))
+    })
+}
+
+/// SOCKS4 (RFC 1928) CONNECT. SOCKS4 has no authentication; a username, when
+/// set, is sent as the USERID field (a user identifier, not a password).
+/// Domain names use SOCKS4a (DSTIP = 0.0.0.255 and the hostname NUL-terminated
+/// after the empty USERID).
+async fn socks4_connect(up: &UpstreamConfig, target: &str) -> std::io::Result<TcpStream> {
+    let (host, port) = split_host_port(target)?;
+    if host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SOCKS4 supports IPv4 targets only",
+        ));
+    }
+    let ip = host.parse::<std::net::Ipv4Addr>().ok();
+
+    let mut req = vec![0x04, 0x01];
+    req.extend_from_slice(&port.to_be_bytes());
+    match ip {
+        Some(v4) => req.extend_from_slice(&v4.octets()),
+        None => req.extend_from_slice(&[0x00, 0x00, 0x00, 0xff]), // SOCKS4a marker
+    }
+    // USERID (may be empty), NUL-terminated.
+    req.extend_from_slice(up.username.as_bytes());
+    req.push(0x00);
+    if ip.is_none() {
+        // SOCKS4a: the domain name follows the empty USERID, NUL-terminated.
+        req.extend_from_slice(host.as_bytes());
+        req.push(0x00);
+    }
+
+    let mut s = TcpStream::connect((up.host.as_str(), up.port)).await?;
+    s.write_all(&req).await?;
+    let mut reply = [0u8; 8];
+    s.read_exact(&mut reply).await?;
+    if reply[1] != 0x5A {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("SOCKS4 upstream rejected the connection (code {})", reply[1]),
+        ));
+    }
+    Ok(s)
+}
+
+/// SOCKS5 (RFC 1928) connect with optional user/pass auth (RFC 1929).
+async fn socks5_connect(up: &UpstreamConfig, target: &str) -> std::io::Result<TcpStream> {
+    let (host, port) = split_host_port(target)?;
 
     let mut s = TcpStream::connect((up.host.as_str(), up.port)).await?;
     let wants_auth = !up.username.is_empty();
@@ -259,7 +404,7 @@ async fn socks5_connect(up: &UpstreamConfig, target: &str) -> std::io::Result<Tc
 }
 
 /// Reads until the end of the header block (`\r\n\r\n`), inclusive.
-async fn read_head(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Vec<u8>> {
     let mut head = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
     loop {

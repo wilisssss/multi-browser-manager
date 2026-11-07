@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS proxies (
     id TEXT PRIMARY KEY,
     label TEXT NOT NULL,
-    protocol TEXT NOT NULL,           -- http | socks5
+    protocol TEXT NOT NULL,           -- http | https | socks4 | socks5
     host TEXT NOT NULL,
     port INTEGER NOT NULL,
     username TEXT,                    -- password disimpan di OS keychain, bukan di sini

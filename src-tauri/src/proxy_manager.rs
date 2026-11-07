@@ -94,7 +94,7 @@ pub fn generate_auth_proxy_extension(
 
     // Map our protocol names to chrome.proxy scheme values.
     let scheme = match protocol {
-        "socks5" => "socks5",
+        "https" | "socks4" | "socks5" => protocol,
         _ => "http",
     };
 
@@ -277,7 +277,39 @@ fn encode_credential(s: &str) -> String {
     utf8_percent_encode(s, CRED_SET).to_string()
 }
 
-/// Tests a proxy by requesting an IP-echo endpoint through it.
+/// Exit-node identity: IP plus country and ASN, from one ipwho.is request.
+#[derive(Default)]
+struct GeoInfo {
+    ip: Option<String>,
+    country: Option<String>,
+    country_code: Option<String>,
+    asn: Option<String>,
+    asn_org: Option<String>,
+}
+
+/// Parses an ipwho.is response body. ipwho.is answers HTTP 200 with
+/// `{"success": false, ...}` when it rate-limits; treat that as "no data".
+/// Extracted for unit tests.
+fn parse_ipwhois(body: &str) -> Option<GeoInfo> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+        return None;
+    }
+    let ip = v.get("ip").and_then(serde_json::Value::as_str)?.to_string();
+    Some(GeoInfo {
+        ip: Some(ip),
+        country: v.get("country").and_then(serde_json::Value::as_str).map(str::to_string),
+        country_code: v.get("country_code").and_then(serde_json::Value::as_str).map(str::to_string),
+        asn: v
+            .pointer("/connection/asn")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| format!("AS{n}")),
+        asn_org: v.pointer("/connection/org").and_then(serde_json::Value::as_str).map(str::to_string),
+    })
+}
+
+/// One request, IP + country + ASN. Falls back to api.ipify.org for the IP
+/// when ipwho.is rate-limits or is unreachable.
 pub async fn test_proxy_connection(
     protocol: &str,
     host: &str,
@@ -289,20 +321,35 @@ pub async fn test_proxy_connection(
 
     let client = build_proxy_client(protocol, host, port, username, password, 10)?;
 
-    match client.get("https://api.ipify.org?format=json").send().await {
+    match client.get("https://ipwho.is/").send().await {
         Ok(resp) => {
             let latency = started.elapsed().as_millis();
-            let ip = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("ip").and_then(|i| i.as_str()).map(|s| s.to_string()));
+            let text = resp.text().await.unwrap_or_default();
+            let mut geo = parse_ipwhois(&text).unwrap_or_default();
+            if geo.ip.is_none() {
+                geo.ip = match client.get("https://api.ipify.org?format=json").send().await {
+                    Ok(r) => r
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("ip").and_then(|i| i.as_str()).map(str::to_string)),
+                    Err(_) => None,
+                };
+            }
 
             Ok(crate::models::proxy::ProxyTestResult {
                 success: true,
                 message: format!("OK ({latency} ms)"),
                 latency_ms: Some(latency),
-                ip,
+                ip: geo.ip,
+                country: geo.country,
+                country_code: geo.country_code,
+                asn: geo.asn,
+                asn_org: geo.asn_org,
+                // Filled in by `test_proxy` once the exit IP has been looked
+                // up in the history table.
+                fresh: false,
+                previously_seen: None,
             })
         }
         Err(e) => Ok(crate::models::proxy::ProxyTestResult {
@@ -310,6 +357,13 @@ pub async fn test_proxy_connection(
             message: format!("Failed: {e}"),
             latency_ms: Some(started.elapsed().as_millis()),
             ip: None,
+            country: None,
+            country_code: None,
+            asn: None,
+            asn_org: None,
+            // No exit IP was seen, so nothing to judge fresh or stale.
+            fresh: true,
+            previously_seen: None,
         }),
     }
 }
@@ -328,11 +382,14 @@ fn build_proxy_client(
     // only works for HTTP proxies. HTTP auth still uses basic_auth().
     let has_auth = username.map(|u| !u.is_empty()).unwrap_or(false);
     let proxy_url = match protocol {
-        "socks5" if has_auth => format!(
+        "socks5" | "socks5h" if has_auth => format!(
             "socks5://{}:{}@{host}:{port}",
             encode_credential(username.unwrap_or("")),
             encode_credential(password.unwrap_or(""))
         ),
+        // SOCKS4/SOCKS4a carry no credentials (the "username" field is a user id,
+        // not an authentication factor), so keep the URL clean there.
+        "socks4" | "socks4a" => format!("socks4://{host}:{port}"),
         _ => format!("{protocol}://{host}:{port}"),
     };
     let mut proxy = reqwest::Proxy::all(&proxy_url)?;
@@ -358,15 +415,9 @@ pub fn lookup_timezone_via_proxy(
 ) -> Option<String> {
     let client = build_proxy_client(protocol, host, port, username, password, 5).ok()?;
     tauri::async_runtime::block_on(async {
-        let text = client
-            .get("https://ipapi.co/timezone/")
-            .send()
-            .await
-            .ok()?
-            .text()
-            .await
-            .ok()?;
-        let tz = text.trim().to_string();
+        let text = client.get("https://ipwho.is/").send().await.ok()?.text().await.ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let tz = v.pointer("/timezone/id")?.as_str()?.trim().to_string();
         is_plausible_timezone(&tz).then_some(tz)
     })
 }
@@ -381,7 +432,7 @@ pub fn is_plausible_timezone(tz: &str) -> bool {
 
 /// Whether a proxy protocol can be used by Chromium's `--proxy-server` flag.
 pub fn is_supported_protocol(p: &str) -> bool {
-    matches!(p, "http" | "socks5")
+    matches!(p, "http" | "https" | "socks4" | "socks5")
 }
 
 pub fn ensure_valid_protocol(p: &str) -> AppResult<()> {
@@ -389,7 +440,7 @@ pub fn ensure_valid_protocol(p: &str) -> AppResult<()> {
         Ok(())
     } else {
         Err(AppError::validation(format!(
-            "Unsupported proxy protocol: {p} (expected http or socks5)"
+            "Unsupported proxy protocol: {p} (expected http, https, socks4 or socks5)"
         )))
     }
 }
@@ -475,8 +526,27 @@ mod tests {
     #[test]
     fn protocol_validation() {
         assert!(ensure_valid_protocol("http").is_ok());
+        assert!(ensure_valid_protocol("https").is_ok());
+        assert!(ensure_valid_protocol("socks4").is_ok());
         assert!(ensure_valid_protocol("socks5").is_ok());
         assert!(ensure_valid_protocol("ftp").is_err());
+    }
+
+    #[test]
+    fn ipwhois_parser_extracts_country_and_asn() {
+        let body = r#"{"ip":"103.158.13.103","success":true,"country":"Indonesia","country_code":"ID","connection":{"asn":138089,"org":"Fiberbyte"},"timezone":{"id":"Asia/Jakarta"}}"#;
+        let geo = parse_ipwhois(body).expect("parsed");
+        assert_eq!(geo.ip.as_deref(), Some("103.158.13.103"));
+        assert_eq!(geo.country.as_deref(), Some("Indonesia"));
+        assert_eq!(geo.country_code.as_deref(), Some("ID"));
+        assert_eq!(geo.asn.as_deref(), Some("AS138089"));
+        assert_eq!(geo.asn_org.as_deref(), Some("Fiberbyte"));
+    }
+
+    #[test]
+    fn ipwhois_parser_treats_rate_limit_as_no_data() {
+        let body = r#"{"success":false,"message":"Monthly quota reached"}"#;
+        assert!(parse_ipwhois(body).is_none());
     }
 
     #[test]

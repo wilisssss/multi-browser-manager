@@ -36,6 +36,10 @@ const PHONE_SCREENS: &[(&str, u32, u32)] = &[
     ("Mozilla/5.0 (Linux; Android 15; Infinix X6858 Build/AP4A.250105.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/151.0.7922.199 Mobile Safari/537.36", 412, 915),
     ("Mozilla/5.0 (Linux; Android 14; Infinix X6861 Build/SP1A.210812.016) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.7727.137 Mobile Safari/537.36", 393, 886),
     ("Mozilla/5.0 (Linux; Android 15; nubia NX736J Build/AP4A.250105.002) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.36 Mobile Safari/537.36", 450, 996),
+    // Symbian feature phone: no Client Hints, no touch, DPR 1, 360×640 CSS
+    // pixels (S60 5th-edition panels; the 5610's own 240×320 is too small to
+    // read modern pages).
+    ("Mozilla/6.0 (SymbianOS/9.4; U; Series60/5.0 Nokia5610 XpressMusic/2.0 (08.23); Profile/MIDP-2.1 Configuration/CLDC-1.1 ) AppleWebKit/525 (KHTML, like Gecko) Version/3.0 Safari/525", 360, 640),
 ];
 
 /// Portrait `(width, height)` for a known phone user agent, `None` otherwise.
@@ -52,10 +56,21 @@ pub fn phone_screen_for_ua(ua: &str) -> Option<(u32, u32)> {
 /// 412 dp → 2.625) instead of the host desktop's 1.
 pub fn phone_dpr_for_width(width: u32) -> f64 {
     match width {
+        240 => 1.0,
         432 => 2.5,
         412 => 2.625,
         360 => 3.0,
         _ => 2.75,
+    }
+}
+
+/// Device pixel ratio for a phone preset. High-density panels came with
+/// Android; Symbian-era screens report 1× despite their CSS width.
+pub fn phone_dpr_for_ua(ua: &str, width: u32) -> f64 {
+    if ua.contains("Symbian") {
+        1.0
+    } else {
+        phone_dpr_for_width(width)
     }
 }
 
@@ -129,6 +144,12 @@ mod tests {
     #[test]
     fn every_preset_maps_to_a_gpu() {
         for (ua, _, _) in PHONE_SCREENS {
+            // Symbian WebKit has no WebGL, so the script leaves the unmasked
+            // parameters alone instead of inventing an Android GPU.
+            if !ua.contains("Chrome/") {
+                assert_eq!(phone_gpu_for_ua(ua), None);
+                continue;
+            }
             let (vendor, renderer) =
                 phone_gpu_for_ua(ua).unwrap_or_else(|| panic!("no GPU mapping for {ua}"));
             assert!(!vendor.is_empty() && !renderer.is_empty());
@@ -149,10 +170,22 @@ mod tests {
 
     #[test]
     fn dpr_follows_the_density_bucket() {
+        assert_eq!(phone_dpr_for_width(240), 1.0);
         assert_eq!(phone_dpr_for_width(412), 2.625);
         assert_eq!(phone_dpr_for_width(360), 3.0);
         assert_eq!(phone_dpr_for_width(432), 2.5);
         assert_eq!(phone_dpr_for_width(450), 2.75);
+    }
+
+    #[test]
+    fn symbian_dpr_is_one_regardless_of_width() {
+        let symbian = PHONE_SCREENS
+            .iter()
+            .find(|(ua, _, _)| ua.contains("Symbian"))
+            .map(|(ua, w, _)| phone_dpr_for_ua(ua, *w));
+        assert_eq!(symbian, Some(1.0));
+        let android = PHONE_SCREENS[0];
+        assert_eq!(phone_dpr_for_ua(android.0, android.1), 2.75);
     }
 
     /// The frontend list (`src/lib/userAgents.ts`) is the user-visible source
@@ -173,7 +206,7 @@ mod tests {
             let Some(end) = after.find('"') else { break };
             let ua = &after[..end];
             rest = &after[end..];
-            if !ua.starts_with("Mozilla/5.0 ") {
+            if !ua.starts_with("Mozilla/") {
                 continue;
             }
 

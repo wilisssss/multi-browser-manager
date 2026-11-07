@@ -43,6 +43,9 @@ pub struct Plan {
     /// Viewport `(width, height)`, applied as a mobile-sized device when `mobile`.
     pub viewport: Option<(u32, u32)>,
     pub mobile: bool,
+    /// Whether the emulated device has a touch screen. Phone viewports are
+    /// also used by keypad phones (Symbian), which must not get touch input.
+    pub touch: bool,
     /// Device pixel ratio for the emulated screen. Phones report a density
     /// bucket (2.5–3), never the host's 1, so it is derived per screen width.
     pub device_scale_factor: Option<f64>,
@@ -257,7 +260,7 @@ fn page_identity_commands(plan: &Plan) -> Vec<(String, Value)> {
             metrics["screenOrientation"] = json!({ "type": "portraitPrimary", "angle": 0 });
         }
         commands.push(("Emulation.setDeviceMetricsOverride".to_string(), metrics));
-        if plan.mobile {
+        if plan.touch {
             commands.push((
                 "Emulation.setTouchEmulationEnabled".to_string(),
                 json!({ "enabled": true, "maxTouchPoints": 5 }),
@@ -326,7 +329,7 @@ mod tests {
 
     #[test]
     fn device_metrics_carry_the_screen_size() {
-        let plan = Plan { viewport: Some((412, 915)), mobile: true, ..Default::default() };
+        let plan = Plan { viewport: Some((412, 915)), mobile: true, touch: true, ..Default::default() };
         let commands = page_identity_commands(&plan);
         let (_, params) = commands
             .iter()
@@ -347,6 +350,18 @@ mod tests {
             .expect("touch emulation for phones");
         assert_eq!(touch["enabled"], true);
         assert_eq!(touch["maxTouchPoints"], 5);
+    }
+
+    #[test]
+    fn keypad_phone_gets_a_phone_viewport_without_touch() {
+        let plan = Plan { viewport: Some((240, 320)), mobile: true, ..Default::default() };
+        let commands = page_identity_commands(&plan);
+        assert!(commands
+            .iter()
+            .any(|(m, _)| m == "Emulation.setDeviceMetricsOverride"));
+        assert!(!commands
+            .iter()
+            .any(|(m, _)| m == "Emulation.setTouchEmulationEnabled"));
     }
 
     #[test]

@@ -104,7 +104,7 @@ export interface DeletedProfileInfo {
 export interface Proxy {
   id: string;
   label: string;
-  protocol: "http" | "socks5";
+  protocol: "http" | "https" | "socks4" | "socks5";
   host: string;
   port: number;
   username: string | null;
@@ -129,11 +129,62 @@ export interface UpdateProxyInput {
   password?: string | null;
 }
 
+/** One successful proxy test: the exit identity the proxy showed. */
+export interface ProxyExitTest {
+  id: number;
+  proxyId: string;
+  ip: string;
+  country: string | null;
+  countryCode: string | null;
+  asn: string | null;
+  asnOrg: string | null;
+  testedAt: number;
+}
+
+/** Freshness verdict: an exit IP a rotating proxy returned that was used before. */
+export interface ProxySeenBefore {
+  count: number;
+  lastSeenAt: number;
+}
+
+export interface ResetProxyHistoryInput {
+  proxyId: string;
+}
+
 export interface ProxyTestResult {
   success: boolean;
   message: string;
   latencyMs: number | null;
   ip: string | null;
+  /** Country name, e.g. "Indonesia". Absent when the lookup fails. */
+  country: string | null;
+  /** ISO 3166-1 alpha-2, e.g. "ID". */
+  countryCode: string | null;
+  /** ASN in AS<digits> notation, e.g. "AS138089". */
+  asn: string | null;
+  /** ASN organization name, e.g. "Fiberbyte". */
+  asnOrg: string | null;
+  /** True when this exit IP has never been seen in a successful test before. */
+  fresh: boolean;
+  /** Same exit IP seen in earlier tests. `null` exactly when `fresh`. */
+  previouslySeen: ProxySeenBefore | null;
+}
+
+export interface ImportProxiesInput {
+  /** Endpoint whose response is a proxy list (one per line, or JSON array). */
+  endpoint: string;
+  /** Protocol for lines without a scheme. */
+  defaultProtocol?: string | null;
+  /** Prepended to the host:port label. */
+  labelPrefix?: string | null;
+}
+
+export interface ProxyImportResult {
+  imported: number;
+  duplicates: number;
+  invalid: number;
+  /** Parse failures / rollback errors, capped at 20 entries. */
+  errors: string[];
 }
 
 export interface BrowserInfo {

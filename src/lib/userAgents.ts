@@ -233,6 +233,17 @@ export const PHONE_DEVICES: PhoneDevice[] = [
       "Mozilla/5.0 (Linux; Android 15; nubia NX736J Build/AP4A.250105.002) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.36 Mobile Safari/537.36",
     screen: { width: 450, height: 996 },
   },
+  // Legacy feature phone: Symbian WebKit, not Android/Chromium, so it has no
+  // Client Hints and no touch input. The 5610's own panel was 240×320, but
+  // that is unusably small for modern pages; S60 5th-edition Symbian phones
+  // such as the 5800/N8 shipped 360×640, which this preset emulates instead.
+  {
+    id: "nokia-5610-xpressmusic",
+    name: "Nokia 5610 XpressMusic (Symbian)",
+    userAgent:
+      "Mozilla/6.0 (SymbianOS/9.4; U; Series60/5.0 Nokia5610 XpressMusic/2.0 (08.23); Profile/MIDP-2.1 Configuration/CLDC-1.1 ) AppleWebKit/525 (KHTML, like Gecko) Version/3.0 Safari/525",
+    screen: { width: 360, height: 640 },
+  },
 ];
 
 /** Finds the device whose user agent matches exactly, if any. */

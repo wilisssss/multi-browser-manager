@@ -5,6 +5,10 @@ import type {
   CreateCredentialInput,
   CreateProfileInput,
   CreateProxyInput,
+  ImportProxiesInput,
+  ProxyImportResult,
+  ProxyExitTest,
+  ResetProxyHistoryInput,
   Credential,
   DeletedProfileInfo,
   ImportResult,
@@ -79,6 +83,12 @@ export const updateProxy = (id: string, input: UpdateProxyInput) =>
   invoke<Proxy>("update_proxy", { id, input });
 export const deleteProxy = (id: string) => invoke<void>("delete_proxy", { id });
 export const testProxy = (id: string) => invoke<ProxyTestResult>("test_proxy", { id });
+export const importProxiesFromUrl = (input: ImportProxiesInput) =>
+  invoke<ProxyImportResult>("import_proxies_from_url", { input });
+export const getProxyTests = (proxyId: string) =>
+  invoke<ProxyExitTest[]>("get_proxy_tests", { proxyId });
+export const resetProxyHistory = (input: ResetProxyHistoryInput) =>
+  invoke<void>("reset_proxy_history", { input });
 
 // Backup
 export const exportProfiles = (path: string) => invoke<void>("export_profiles", { path });

@@ -4,6 +4,7 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod proxy_manager;
+pub mod proxy_import;
 pub mod services;
 pub mod startup;
 pub mod sync;
@@ -109,11 +110,17 @@ mod cli {
 
     /// Desktop notification for CLI failures — keybind errors are otherwise
     /// invisible (stderr goes nowhere when spawned by a WM).
+    ///
+    /// The timeout must be explicit: notify-rust sends `expire_timeout = -1`
+    /// by default ("use the server default"), and mako's `default-timeout` is
+    /// 0 (= never expire), so the popup would stay on screen forever until
+    /// dismissed by hand. Requesting 5s makes mako close it automatically.
     fn notify_failure(message: &str) {
         eprintln!("mbm: {message}");
         let _ = notify_rust::Notification::new()
             .summary("Multi Browser Manager")
             .body(message)
+            .timeout(std::time::Duration::from_secs(5))
             .show();
     }
 
@@ -407,6 +414,9 @@ pub fn run() {
             commands::proxy::update_proxy,
             commands::proxy::delete_proxy,
             commands::proxy::test_proxy,
+            commands::proxy::get_proxy_tests,
+            commands::proxy::reset_proxy_history,
+            commands::proxy::import_proxies_from_url,
             // Backup
             commands::backup::export_profiles,
             commands::backup::export_profiles_encrypted,
